@@ -15,11 +15,15 @@ The result is a spectrum:
 
 ## Current Pipeline
 
-1. Assign ranks from directed edges using a longest-path DAG pass.
-2. Preserve partial hierarchy for cyclic leftovers with local edge pressure.
-3. Order nodes inside each rank with repeated barycenter sweeps.
-4. Generate rank, order, and edge-direction constraints.
-5. Relax the graph with deterministic force iterations.
+1. Analyze graph anatomy: weak components, SCCs, bridges, articulation points,
+   edge roles, degree metrics, and cyclic nodes.
+2. Assign ranks from directed edges using a longest-path DAG pass.
+3. Preserve partial hierarchy for cyclic leftovers with local edge pressure.
+4. Order nodes inside each rank with repeated barycenter sweeps.
+5. Generate rank, order, and edge-direction constraints.
+6. Relax the graph with deterministic force iterations.
+7. Emit fold groups for renderer-side collapse, expansion, highlighting, or
+   protein-ish folding.
 
 ## Example
 
@@ -67,6 +71,46 @@ for node in result.nodes {
 For Bevy, map `NodeLayout3d::as_xyz()` directly into `Vec3::new(x, y, z)`.
 The crate does not depend on Bevy just to borrow its vector type; the layout
 core stays small and renderer-agnostic.
+
+## Graph Analysis And Folding
+
+The crate exposes `analyze(&graph)` for layout-independent structure reads:
+
+- weak components
+- strongly connected components
+- articulation points
+- bridge edges
+- per-node degree metrics
+- edge roles
+- cyclic node flags
+
+`layout_3d` uses that same analysis to add structural pressure:
+
+- SCC cohesion folds cycles and tight feedback regions into local bodies.
+- weak component cohesion keeps broad regions visually legible.
+- bridge hinges keep connector edges readable between bodies.
+- centrality anchoring keeps important nodes from drifting into decorative exile.
+- cycle folding uses depth so feedback does not have to lose every argument
+  against hierarchy.
+
+The result includes `fold_groups`, which are renderer-facing bodies:
+
+```rust
+for group in result.fold_groups {
+    println!(
+        "{:?}: center={:?} radius={} nodes={}",
+        group.kind,
+        group.center,
+        group.radius,
+        group.nodes.len()
+    );
+}
+```
+
+Fold groups currently cover weak components, strongly connected components, and
+cycle bodies. They are meant to be useful handles for Bevy interactions:
+collapse a component, pulse a cycle, dim a subtree, or unfold a dense region
+without asking the raw node soup for permission.
 
 ## Notes
 
