@@ -108,6 +108,50 @@ Lower theta values are more accurate; higher values are faster. Large graphs
 still want multilevel coarsening, because even good approximation does not make
 every visual decision worth rendering individually.
 
+## Accuracy Sweeps
+
+Use the repulsion accuracy sweep to compare approximation settings against exact
+all-pairs repulsion on the same positions:
+
+```rust
+use epiphany_graph_rs::{
+    repulsion_accuracy_sweep, Layout3dConfig, RepulsionAccuracyCandidate,
+};
+
+let positions = [
+    [0.0, 0.0, 0.0],
+    [120.0, 20.0, 40.0],
+    [-80.0, 10.0, -60.0],
+];
+
+let reports = repulsion_accuracy_sweep(
+    &positions,
+    &Layout3dConfig::default(),
+    &[
+        RepulsionAccuracyCandidate::barnes_hut(0.4),
+        RepulsionAccuracyCandidate::barnes_hut(0.7),
+        RepulsionAccuracyCandidate::barnes_hut(1.0),
+        RepulsionAccuracyCandidate::spatial_grid(180.0, 1),
+    ],
+);
+
+for report in reports {
+    println!(
+        "{:?}: mean_rel={} rms_rel={} max_rel={} elapsed={:?}",
+        report.candidate.repulsion_mode,
+        report.mean_relative_error,
+        report.rms_relative_error,
+        report.max_relative_error,
+        report.elapsed
+    );
+}
+```
+
+For a live Bevy-style solver, call `solver_repulsion_accuracy_sweep(&solver,
+&candidates)` to evaluate the current positions without advancing the layout.
+This is the tuning harness: sweep theta, grid radius, and later force-category
+scale knobs until the error/time curve stops paying rent.
+
 ## Graph Analysis And Folding
 
 The crate exposes `analyze(&graph)` for layout-independent structure reads:

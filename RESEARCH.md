@@ -18,6 +18,7 @@ These features are implemented in the crate now:
 - Warm-start positions for graph edits and interaction.
 - Barnes-Hut octree repulsion for the 3D solver.
 - Spatial-grid approximate repulsion as a simpler fallback.
+- Repulsion accuracy sweeps against exact all-pairs ground truth.
 - SCC detection for cyclic bodies.
 - weak components for broad spatial islands.
 - articulation points and bridges for hinge-like connectors.
@@ -82,6 +83,8 @@ Current state:
 - `RepulsionMode::BarnesHut` is the default realtime path.
 - `RepulsionMode::SpatialGrid` remains available as a simpler local approximation.
 - `RepulsionMode::Exact` remains available for small graphs and comparisons.
+- `repulsion_accuracy_sweep` and `solver_repulsion_accuracy_sweep` report
+  absolute/relative error and elapsed time for tuning passes.
 
 Source:
 https://doi.org/10.1371/journal.pone.0098679

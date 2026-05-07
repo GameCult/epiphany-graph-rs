@@ -6,6 +6,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 /// Index of a node in a [`Graph`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -194,6 +195,57 @@ pub enum RepulsionMode {
     BarnesHut,
     /// Approximate local repulsion through a uniform spatial grid.
     SpatialGrid,
+}
+
+/// One approximation setting to compare against exact repulsion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RepulsionAccuracyCandidate {
+    pub repulsion_mode: RepulsionMode,
+    pub barnes_hut_theta: f32,
+    pub grid_cell_size: f32,
+    pub grid_radius: i32,
+}
+
+impl RepulsionAccuracyCandidate {
+    pub fn barnes_hut(theta: f32) -> Self {
+        Self {
+            repulsion_mode: RepulsionMode::BarnesHut,
+            barnes_hut_theta: theta,
+            grid_cell_size: Layout3dConfig::default().grid_cell_size,
+            grid_radius: Layout3dConfig::default().grid_radius,
+        }
+    }
+
+    pub fn spatial_grid(cell_size: f32, radius: i32) -> Self {
+        Self {
+            repulsion_mode: RepulsionMode::SpatialGrid,
+            barnes_hut_theta: Layout3dConfig::default().barnes_hut_theta,
+            grid_cell_size: cell_size,
+            grid_radius: radius,
+        }
+    }
+
+    pub fn exact() -> Self {
+        Self {
+            repulsion_mode: RepulsionMode::Exact,
+            barnes_hut_theta: Layout3dConfig::default().barnes_hut_theta,
+            grid_cell_size: Layout3dConfig::default().grid_cell_size,
+            grid_radius: Layout3dConfig::default().grid_radius,
+        }
+    }
+}
+
+/// Accuracy and runtime for one repulsion approximation candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForceAccuracyReport {
+    pub candidate: RepulsionAccuracyCandidate,
+    pub node_count: usize,
+    pub elapsed: Duration,
+    pub mean_absolute_error: f32,
+    pub max_absolute_error: f32,
+    pub mean_relative_error: f32,
+    pub rms_relative_error: f32,
+    pub max_relative_error: f32,
 }
 
 /// Output for one laid-out node.
@@ -523,6 +575,58 @@ pub fn layout_3d(graph: &Graph, config: &Layout3dConfig) -> Layout3d {
     let mut solver = Layout3dSolver::new(graph.clone(), config.clone());
     solver.tick(config.base.iterations);
     solver.snapshot()
+}
+
+/// Compare repulsion approximations against exact all-pairs repulsion.
+///
+/// The input positions use Bevy-friendly `[x, y, z]` coordinates. The returned
+/// reports let callers sweep Barnes-Hut theta, grid size/radius, and exact mode
+/// to find the performance/accuracy knee for a real graph shape.
+pub fn repulsion_accuracy_sweep(
+    positions: &[[f32; 3]],
+    config: &Layout3dConfig,
+    candidates: &[RepulsionAccuracyCandidate],
+) -> Vec<ForceAccuracyReport> {
+    let tuple_positions = positions
+        .iter()
+        .map(|position| (position[0], position[1], position[2]))
+        .collect::<Vec<_>>();
+    repulsion_accuracy_sweep_tuples(&tuple_positions, config, candidates)
+}
+
+/// Compare repulsion approximations using the current positions of a live solver.
+pub fn solver_repulsion_accuracy_sweep(
+    solver: &Layout3dSolver,
+    candidates: &[RepulsionAccuracyCandidate],
+) -> Vec<ForceAccuracyReport> {
+    repulsion_accuracy_sweep_tuples(solver.positions(), &solver.config, candidates)
+}
+
+fn repulsion_accuracy_sweep_tuples(
+    positions: &[(f32, f32, f32)],
+    config: &Layout3dConfig,
+    candidates: &[RepulsionAccuracyCandidate],
+) -> Vec<ForceAccuracyReport> {
+    let mut exact_config = config.clone();
+    exact_config.repulsion_mode = RepulsionMode::Exact;
+    let exact_forces = compute_repulsion_forces(positions, &exact_config);
+
+    candidates
+        .iter()
+        .map(|candidate| {
+            let mut candidate_config = config.clone();
+            candidate_config.repulsion_mode = candidate.repulsion_mode;
+            candidate_config.barnes_hut_theta = candidate.barnes_hut_theta;
+            candidate_config.grid_cell_size = candidate.grid_cell_size;
+            candidate_config.grid_radius = candidate.grid_radius;
+
+            let started = Instant::now();
+            let forces = compute_repulsion_forces(positions, &candidate_config);
+            let elapsed = started.elapsed();
+
+            force_accuracy_report(*candidate, elapsed, &exact_forces, &forces)
+        })
+        .collect()
 }
 
 /// Analyze graph structure without running layout.
@@ -1670,6 +1774,66 @@ fn apply_repulsion_3d_exact(
     }
 }
 
+fn compute_repulsion_forces(
+    positions: &[(f32, f32, f32)],
+    config: &Layout3dConfig,
+) -> Vec<(f32, f32, f32)> {
+    let mut forces = vec![(0.0f32, 0.0f32, 0.0f32); positions.len()];
+    match config.repulsion_mode {
+        RepulsionMode::Exact => apply_repulsion_3d_exact(positions, &mut forces, config),
+        RepulsionMode::BarnesHut => apply_repulsion_3d_barnes_hut(positions, &mut forces, config),
+        RepulsionMode::SpatialGrid => apply_repulsion_3d_grid(positions, &mut forces, config),
+    }
+    forces
+}
+
+fn force_accuracy_report(
+    candidate: RepulsionAccuracyCandidate,
+    elapsed: Duration,
+    exact_forces: &[(f32, f32, f32)],
+    approximation_forces: &[(f32, f32, f32)],
+) -> ForceAccuracyReport {
+    let mut absolute_sum = 0.0f32;
+    let mut relative_sum = 0.0f32;
+    let mut relative_square_sum = 0.0f32;
+    let mut max_absolute_error = 0.0f32;
+    let mut max_relative_error = 0.0f32;
+
+    for (&exact, &approximation) in exact_forces.iter().zip(approximation_forces.iter()) {
+        let error = (
+            approximation.0 - exact.0,
+            approximation.1 - exact.1,
+            approximation.2 - exact.2,
+        );
+        let absolute_error = magnitude_3d(error);
+        let relative_error = absolute_error / magnitude_3d(exact).max(0.001);
+
+        absolute_sum += absolute_error;
+        relative_sum += relative_error;
+        relative_square_sum += relative_error * relative_error;
+        max_absolute_error = max_absolute_error.max(absolute_error);
+        max_relative_error = max_relative_error.max(relative_error);
+    }
+
+    let node_count = exact_forces.len();
+    let denominator = node_count.max(1) as f32;
+
+    ForceAccuracyReport {
+        candidate,
+        node_count,
+        elapsed,
+        mean_absolute_error: absolute_sum / denominator,
+        max_absolute_error,
+        mean_relative_error: relative_sum / denominator,
+        rms_relative_error: (relative_square_sum / denominator).sqrt(),
+        max_relative_error,
+    }
+}
+
+fn magnitude_3d(vector: (f32, f32, f32)) -> f32 {
+    (vector.0 * vector.0 + vector.1 * vector.1 + vector.2 * vector.2).sqrt()
+}
+
 fn apply_repulsion_3d_barnes_hut(
     positions: &[(f32, f32, f32)],
     forces: &mut [(f32, f32, f32)],
@@ -2397,5 +2561,69 @@ mod tests {
         solver.tick(2);
 
         assert_eq!(solver.snapshot().nodes.len(), 2);
+    }
+
+    #[test]
+    fn repulsion_accuracy_sweep_reports_exact_as_zero_error() {
+        let positions = [[0.0, 0.0, 0.0], [100.0, 20.0, 10.0], [-80.0, 40.0, -30.0]];
+        let reports = repulsion_accuracy_sweep(
+            &positions,
+            &Layout3dConfig::default(),
+            &[RepulsionAccuracyCandidate::exact()],
+        );
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].node_count, 3);
+        assert_eq!(reports[0].mean_absolute_error, 0.0);
+        assert_eq!(reports[0].max_relative_error, 0.0);
+    }
+
+    #[test]
+    fn repulsion_accuracy_sweep_compares_approximation_modes() {
+        let positions = [
+            [0.0, 0.0, 0.0],
+            [100.0, 20.0, 10.0],
+            [-80.0, 40.0, -30.0],
+            [240.0, -10.0, 55.0],
+            [-180.0, 75.0, 90.0],
+        ];
+        let reports = repulsion_accuracy_sweep(
+            &positions,
+            &Layout3dConfig::default(),
+            &[
+                RepulsionAccuracyCandidate::barnes_hut(0.4),
+                RepulsionAccuracyCandidate::barnes_hut(1.0),
+                RepulsionAccuracyCandidate::spatial_grid(150.0, 1),
+            ],
+        );
+
+        assert_eq!(reports.len(), 3);
+        assert!(reports.iter().all(|report| report.node_count == 5));
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.mean_relative_error.is_finite())
+        );
+    }
+
+    #[test]
+    fn solver_repulsion_accuracy_sweep_uses_live_positions() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(1.0);
+        let b = graph.add_node(1.0);
+        graph.add_edge(a, b);
+        let mut solver = Layout3dSolver::new(graph, Layout3dConfig::default());
+        solver.tick(1);
+
+        let reports = solver_repulsion_accuracy_sweep(
+            &solver,
+            &[
+                RepulsionAccuracyCandidate::exact(),
+                RepulsionAccuracyCandidate::barnes_hut(0.8),
+            ],
+        );
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].node_count, solver.positions().len());
     }
 }
