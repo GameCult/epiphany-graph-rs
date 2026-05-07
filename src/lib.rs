@@ -164,6 +164,14 @@ pub struct Layout3dConfig {
     pub near_repulsion_scale: f32,
     /// Scale for Barnes-Hut aggregate far-field repulsion.
     pub far_repulsion_scale: f32,
+    /// Repulsion strategy used inside analyzed fold/body groups.
+    pub body_repulsion_mode: RepulsionMode,
+    /// Scale for intra-body node repulsion.
+    pub body_repulsion_scale: f32,
+    /// Maximum body size that receives exact intra-body repulsion.
+    pub body_exact_limit: usize,
+    /// Scale for repulsion between fold-group bodies.
+    pub body_far_repulsion_scale: f32,
 }
 
 impl Default for Layout3dConfig {
@@ -191,6 +199,10 @@ impl Default for Layout3dConfig {
             barnes_hut_near_radius: 180.0,
             near_repulsion_scale: 1.0,
             far_repulsion_scale: 1.0,
+            body_repulsion_mode: RepulsionMode::Exact,
+            body_repulsion_scale: 0.35,
+            body_exact_limit: 512,
+            body_far_repulsion_scale: 0.8,
         }
     }
 }
@@ -216,6 +228,10 @@ pub struct RepulsionAccuracyCandidate {
     pub barnes_hut_near_radius: f32,
     pub near_repulsion_scale: f32,
     pub far_repulsion_scale: f32,
+    pub body_repulsion_mode: RepulsionMode,
+    pub body_repulsion_scale: f32,
+    pub body_exact_limit: usize,
+    pub body_far_repulsion_scale: f32,
 }
 
 impl RepulsionAccuracyCandidate {
@@ -228,6 +244,10 @@ impl RepulsionAccuracyCandidate {
             barnes_hut_near_radius: Layout3dConfig::default().barnes_hut_near_radius,
             near_repulsion_scale: Layout3dConfig::default().near_repulsion_scale,
             far_repulsion_scale: Layout3dConfig::default().far_repulsion_scale,
+            body_repulsion_mode: Layout3dConfig::default().body_repulsion_mode,
+            body_repulsion_scale: Layout3dConfig::default().body_repulsion_scale,
+            body_exact_limit: Layout3dConfig::default().body_exact_limit,
+            body_far_repulsion_scale: Layout3dConfig::default().body_far_repulsion_scale,
         }
     }
 
@@ -240,6 +260,31 @@ impl RepulsionAccuracyCandidate {
             barnes_hut_near_radius: near_radius,
             near_repulsion_scale: Layout3dConfig::default().near_repulsion_scale,
             far_repulsion_scale: far_scale,
+            body_repulsion_mode: Layout3dConfig::default().body_repulsion_mode,
+            body_repulsion_scale: Layout3dConfig::default().body_repulsion_scale,
+            body_exact_limit: Layout3dConfig::default().body_exact_limit,
+            body_far_repulsion_scale: Layout3dConfig::default().body_far_repulsion_scale,
+        }
+    }
+
+    pub fn structured(
+        body_mode: RepulsionMode,
+        body_scale: f32,
+        body_far_scale: f32,
+        exact_limit: usize,
+    ) -> Self {
+        Self {
+            repulsion_mode: RepulsionMode::BarnesHut,
+            barnes_hut_theta: Layout3dConfig::default().barnes_hut_theta,
+            grid_cell_size: Layout3dConfig::default().grid_cell_size,
+            grid_radius: Layout3dConfig::default().grid_radius,
+            barnes_hut_near_radius: Layout3dConfig::default().barnes_hut_near_radius,
+            near_repulsion_scale: Layout3dConfig::default().near_repulsion_scale,
+            far_repulsion_scale: Layout3dConfig::default().far_repulsion_scale,
+            body_repulsion_mode: body_mode,
+            body_repulsion_scale: body_scale,
+            body_exact_limit: exact_limit,
+            body_far_repulsion_scale: body_far_scale,
         }
     }
 
@@ -252,6 +297,10 @@ impl RepulsionAccuracyCandidate {
             barnes_hut_near_radius: Layout3dConfig::default().barnes_hut_near_radius,
             near_repulsion_scale: Layout3dConfig::default().near_repulsion_scale,
             far_repulsion_scale: Layout3dConfig::default().far_repulsion_scale,
+            body_repulsion_mode: Layout3dConfig::default().body_repulsion_mode,
+            body_repulsion_scale: Layout3dConfig::default().body_repulsion_scale,
+            body_exact_limit: Layout3dConfig::default().body_exact_limit,
+            body_far_repulsion_scale: Layout3dConfig::default().body_far_repulsion_scale,
         }
     }
 
@@ -264,6 +313,10 @@ impl RepulsionAccuracyCandidate {
             barnes_hut_near_radius: Layout3dConfig::default().barnes_hut_near_radius,
             near_repulsion_scale: Layout3dConfig::default().near_repulsion_scale,
             far_repulsion_scale: Layout3dConfig::default().far_repulsion_scale,
+            body_repulsion_mode: Layout3dConfig::default().body_repulsion_mode,
+            body_repulsion_scale: 0.0,
+            body_exact_limit: Layout3dConfig::default().body_exact_limit,
+            body_far_repulsion_scale: 0.0,
         }
     }
 }
@@ -635,6 +688,42 @@ pub fn solver_repulsion_accuracy_sweep(
     repulsion_accuracy_sweep_tuples(solver.positions(), &solver.config, candidates)
 }
 
+/// Compare full structural-force variants against an exact-node repulsion baseline.
+///
+/// This is intentionally broader than `repulsion_accuracy_sweep`: it evaluates
+/// node repulsion plus body-level structural repulsion, so it can measure the
+/// cost and force delta of organ-style approximations.
+pub fn solver_structural_accuracy_sweep(
+    solver: &Layout3dSolver,
+    candidates: &[RepulsionAccuracyCandidate],
+) -> Vec<ForceAccuracyReport> {
+    let mut exact_config = solver.config.clone();
+    exact_config.repulsion_mode = RepulsionMode::Exact;
+    exact_config.body_repulsion_scale = 0.0;
+    exact_config.body_far_repulsion_scale = 0.0;
+    let exact_forces = compute_repulsion_forces(solver.positions(), &exact_config);
+
+    candidates
+        .iter()
+        .map(|candidate| {
+            let mut candidate_config = solver.config.clone();
+            apply_candidate_config(candidate, &mut candidate_config);
+
+            let started = Instant::now();
+            let mut forces = compute_repulsion_forces(solver.positions(), &candidate_config);
+            apply_body_repulsion_3d(
+                solver.analysis(),
+                solver.positions(),
+                &mut forces,
+                &candidate_config,
+            );
+            let elapsed = started.elapsed();
+
+            force_accuracy_report(*candidate, elapsed, &exact_forces, &forces)
+        })
+        .collect()
+}
+
 fn repulsion_accuracy_sweep_tuples(
     positions: &[(f32, f32, f32)],
     config: &Layout3dConfig,
@@ -648,13 +737,7 @@ fn repulsion_accuracy_sweep_tuples(
         .iter()
         .map(|candidate| {
             let mut candidate_config = config.clone();
-            candidate_config.repulsion_mode = candidate.repulsion_mode;
-            candidate_config.barnes_hut_theta = candidate.barnes_hut_theta;
-            candidate_config.grid_cell_size = candidate.grid_cell_size;
-            candidate_config.grid_radius = candidate.grid_radius;
-            candidate_config.barnes_hut_near_radius = candidate.barnes_hut_near_radius;
-            candidate_config.near_repulsion_scale = candidate.near_repulsion_scale;
-            candidate_config.far_repulsion_scale = candidate.far_repulsion_scale;
+            apply_candidate_config(candidate, &mut candidate_config);
 
             let started = Instant::now();
             let forces = compute_repulsion_forces(positions, &candidate_config);
@@ -663,6 +746,20 @@ fn repulsion_accuracy_sweep_tuples(
             force_accuracy_report(*candidate, elapsed, &exact_forces, &forces)
         })
         .collect()
+}
+
+fn apply_candidate_config(candidate: &RepulsionAccuracyCandidate, config: &mut Layout3dConfig) {
+    config.repulsion_mode = candidate.repulsion_mode;
+    config.barnes_hut_theta = candidate.barnes_hut_theta;
+    config.grid_cell_size = candidate.grid_cell_size;
+    config.grid_radius = candidate.grid_radius;
+    config.barnes_hut_near_radius = candidate.barnes_hut_near_radius;
+    config.near_repulsion_scale = candidate.near_repulsion_scale;
+    config.far_repulsion_scale = candidate.far_repulsion_scale;
+    config.body_repulsion_mode = candidate.body_repulsion_mode;
+    config.body_repulsion_scale = candidate.body_repulsion_scale;
+    config.body_exact_limit = candidate.body_exact_limit;
+    config.body_far_repulsion_scale = candidate.body_far_repulsion_scale;
 }
 
 /// Analyze graph structure without running layout.
@@ -1452,6 +1549,7 @@ fn apply_structural_forces_3d(
     apply_clustering_cohesion(graph, undirected, analysis, positions, forces, config);
     apply_cycle_folds(analysis, positions, forces, config);
     apply_bridge_hinges(graph, analysis, positions, forces, config);
+    apply_body_repulsion_3d(analysis, positions, forces, config);
 }
 
 fn apply_component_cohesion(
@@ -1615,6 +1713,186 @@ fn apply_bridge_hinges(
                     (midpoint.2 - positions[idx].2) * config.bridge_hinge_strength * multiplier;
             }
         }
+    }
+}
+
+fn apply_body_repulsion_3d(
+    analysis: &GraphAnalysis,
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    if config.body_repulsion_scale > 0.0 {
+        apply_intra_body_repulsion(
+            &analysis.strongly_connected_components,
+            positions,
+            forces,
+            config,
+        );
+        apply_intra_body_repulsion(&analysis.communities, positions, forces, config);
+        apply_intra_body_repulsion(&analysis.biconnected_components, positions, forces, config);
+    }
+
+    if config.body_far_repulsion_scale > 0.0 {
+        apply_inter_body_repulsion(&analysis.communities, positions, forces, config);
+        apply_inter_body_repulsion(&analysis.weak_components, positions, forces, config);
+    }
+}
+
+fn apply_intra_body_repulsion(
+    components: &[Component],
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    for component in components {
+        if component.nodes.len() < 2 || component.nodes.len() > config.body_exact_limit {
+            continue;
+        }
+
+        match config.body_repulsion_mode {
+            RepulsionMode::Exact | RepulsionMode::BarnesHut => {
+                for left in 0..component.nodes.len() {
+                    for right in (left + 1)..component.nodes.len() {
+                        apply_scaled_pair_repulsion_3d(
+                            component.nodes[left].0,
+                            component.nodes[right].0,
+                            positions,
+                            forces,
+                            config,
+                            config.body_repulsion_scale,
+                        );
+                    }
+                }
+            }
+            RepulsionMode::SpatialGrid => {
+                apply_intra_body_grid_repulsion(component, positions, forces, config);
+            }
+        }
+    }
+}
+
+fn apply_intra_body_grid_repulsion(
+    component: &Component,
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    let cell_size = config.grid_cell_size.max(1.0);
+    let radius = config.grid_radius.max(0);
+    let mut grid = HashMap::<(i32, i32, i32), Vec<usize>>::new();
+
+    for node in &component.nodes {
+        grid.entry(grid_cell(positions[node.0], cell_size))
+            .or_default()
+            .push(node.0);
+    }
+
+    for node in &component.nodes {
+        let a = node.0;
+        let (cx, cy, cz) = grid_cell(positions[a], cell_size);
+        for x in (cx - radius)..=(cx + radius) {
+            for y in (cy - radius)..=(cy + radius) {
+                for z in (cz - radius)..=(cz + radius) {
+                    if let Some(candidates) = grid.get(&(x, y, z)) {
+                        for &b in candidates {
+                            if b > a {
+                                apply_scaled_pair_repulsion_3d(
+                                    a,
+                                    b,
+                                    positions,
+                                    forces,
+                                    config,
+                                    config.body_repulsion_scale,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn apply_inter_body_repulsion(
+    components: &[Component],
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    let bodies = components
+        .iter()
+        .filter(|component| component.nodes.len() > 1)
+        .map(|component| BodyParticle::from_component(component, positions))
+        .collect::<Vec<_>>();
+
+    for left in 0..bodies.len() {
+        for right in (left + 1)..bodies.len() {
+            apply_body_pair_repulsion(&bodies[left], &bodies[right], forces, config);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BodyParticle {
+    nodes: Vec<NodeId>,
+    center: [f32; 3],
+    radius: f32,
+    mass: f32,
+}
+
+impl BodyParticle {
+    fn from_component(component: &Component, positions: &[(f32, f32, f32)]) -> Self {
+        let center = component_center(&component.nodes, positions);
+        let mut radius = 0.0f32;
+        for node in &component.nodes {
+            let dx = positions[node.0].0 - center[0];
+            let dy = positions[node.0].1 - center[1];
+            let dz = positions[node.0].2 - center[2];
+            radius = radius.max((dx * dx + dy * dy + dz * dz).sqrt());
+        }
+
+        Self {
+            nodes: component.nodes.clone(),
+            center,
+            radius,
+            mass: component.nodes.len() as f32,
+        }
+    }
+}
+
+fn apply_body_pair_repulsion(
+    left: &BodyParticle,
+    right: &BodyParticle,
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    let dx = left.center[0] - right.center[0];
+    let dy = left.center[1] - right.center[1];
+    let dz = left.center[2] - right.center[2];
+    let min_distance = (left.radius + right.radius).max(1.0);
+    let dist2 = (dx * dx + dy * dy + dz * dz).max(min_distance);
+    let dist = dist2.sqrt().max(0.01);
+    let magnitude =
+        config.base.repulsion_strength * config.body_far_repulsion_scale * left.mass * right.mass
+            / dist2;
+    let fx = dx / dist * magnitude * config.horizontal_repulsion;
+    let fy = dy / dist * magnitude * config.vertical_repulsion;
+    let fz = dz / dist * magnitude * config.horizontal_repulsion;
+    let left_share = 1.0 / left.mass.max(1.0);
+    let right_share = 1.0 / right.mass.max(1.0);
+
+    for node in &left.nodes {
+        let idx = node.0;
+        forces[idx].0 += fx * left_share;
+        forces[idx].1 += fy * left_share;
+        forces[idx].2 += fz * left_share;
+    }
+    for node in &right.nodes {
+        let idx = node.0;
+        forces[idx].0 -= fx * right_share;
+        forces[idx].1 -= fy * right_share;
+        forces[idx].2 -= fz * right_share;
     }
 }
 
@@ -2181,12 +2459,23 @@ fn apply_pair_repulsion_3d(
     forces: &mut [(f32, f32, f32)],
     config: &Layout3dConfig,
 ) {
+    apply_scaled_pair_repulsion_3d(a, b, positions, forces, config, config.near_repulsion_scale);
+}
+
+fn apply_scaled_pair_repulsion_3d(
+    a: usize,
+    b: usize,
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+    scale: f32,
+) {
     let dx = positions[a].0 - positions[b].0;
     let dy = positions[a].1 - positions[b].1;
     let dz = positions[a].2 - positions[b].2;
     let dist2 = (dx * dx + dy * dy + dz * dz).max(0.01);
     let dist = dist2.sqrt();
-    let magnitude = config.base.repulsion_strength * config.near_repulsion_scale / dist2;
+    let magnitude = config.base.repulsion_strength * scale / dist2;
     let fx = dx / dist * magnitude * config.horizontal_repulsion;
     let fy = dy / dist * magnitude * config.vertical_repulsion;
     let fz = dz / dist * magnitude * config.horizontal_repulsion;
@@ -2657,6 +2946,15 @@ mod tests {
     }
 
     #[test]
+    fn exact_candidate_disables_body_forces() {
+        let candidate = RepulsionAccuracyCandidate::exact();
+
+        assert_eq!(candidate.repulsion_mode, RepulsionMode::Exact);
+        assert_eq!(candidate.body_repulsion_scale, 0.0);
+        assert_eq!(candidate.body_far_repulsion_scale, 0.0);
+    }
+
+    #[test]
     fn solver_repulsion_accuracy_sweep_uses_live_positions() {
         let mut graph = Graph::new();
         let a = graph.add_node(1.0);
@@ -2675,5 +2973,33 @@ mod tests {
 
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].node_count, solver.positions().len());
+    }
+
+    #[test]
+    fn solver_structural_accuracy_sweep_measures_body_candidates() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(1.0);
+        let b = graph.add_node(1.0);
+        let c = graph.add_node(1.0);
+        graph.add_edge(a, b);
+        graph.add_edge(b, c);
+        graph.add_edge(c, a);
+        let mut solver = Layout3dSolver::new(graph, Layout3dConfig::default());
+        solver.tick(1);
+
+        let reports = solver_structural_accuracy_sweep(
+            &solver,
+            &[
+                RepulsionAccuracyCandidate::exact(),
+                RepulsionAccuracyCandidate::structured(RepulsionMode::Exact, 0.25, 0.5, 64),
+            ],
+        );
+
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.mean_relative_error.is_finite())
+        );
     }
 }

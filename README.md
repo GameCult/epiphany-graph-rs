@@ -160,6 +160,16 @@ For a live Bevy-style solver, call `solver_repulsion_accuracy_sweep(&solver,
 This is the tuning harness: sweep theta, grid radius, and later force-category
 scale knobs until the error/time curve stops paying rent.
 
+Use `organ_battleground` for structure-aware force experiments:
+
+```bash
+.\scripts\fetch_tuning_datasets.ps1
+cargo run --release --example organ_battleground
+```
+
+It compares raw node approximations and body-force candidates on synthetic
+fixtures plus SNAP email/Gnutella datasets when available.
+
 ## Graph Analysis And Folding
 
 The crate exposes `analyze(&graph)` for layout-independent structure reads:

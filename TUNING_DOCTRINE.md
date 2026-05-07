@@ -211,6 +211,102 @@ The doctrine for now is simple: exact is the truth, Barnes-Hut is the large
 scale field, grid is local blunt force, and fold groups are the path to making
 large graphs readable without making every node audition for camera time.
 
+## Organ Battleground
+
+Date: 2026-05-07
+
+Harness:
+
+```bash
+.\scripts\fetch_tuning_datasets.ps1
+cargo run --release --example organ_battleground
+```
+
+Actual datasets:
+
+- SNAP `email-Eu-core`: directed email network from a European research
+  institution, 1,005 nodes and 25,571 edges.
+- SNAP `p2p-Gnutella08`: directed Gnutella peer-to-peer network snapshot from
+  August 8 2002, 6,301 nodes and 20,777 edges. The battleground currently
+  limits it to the first 3,000 remapped nodes for runtime.
+
+Synthetic fixtures:
+
+- `synthetic_layered_512`: hierarchy-heavy layered graph.
+- `synthetic_clustered_1024`: clustered ring/fold graph.
+
+Candidate families:
+
+- raw exact node repulsion
+- raw Barnes-Hut node repulsion
+- raw spatial-grid node repulsion
+- structured body candidates:
+  intra-body exact/grid plus inter-body coarse repulsion
+
+Representative results:
+
+| Dataset | Candidate | Time | Mean Rel Error | RMS Rel Error | Note |
+|---|---:|---:|---:|---:|---|
+| synthetic_layered_512 | exact | 1557 us | 0.000 | 0.000 | Baseline. |
+| synthetic_layered_512 | Barnes-Hut theta 1.0 + body exact | 3774 us | 8.151 | 12.443 | Body forces are not raw-force approximations here. |
+| synthetic_layered_512 | structured theta 0.65, body exact 0.20, body far 0.50 | 2852 us | 5.075 | 7.702 | Less bad, still semantic not physical. |
+| synthetic_clustered_1024 | exact | 5651 us | 0.000 | 0.000 | Baseline. |
+| synthetic_clustered_1024 | spatial grid | 2765 us | 0.491 | 0.498 | Best raw approximation among tested. |
+| synthetic_clustered_1024 | structured grid body | 13920 us | 0.962 | 0.973 | Too much body overhead for this fixture. |
+| snap_email_eu_core | exact | 3405 us | 0.000 | 0.000 | Baseline still cheap around 1k nodes. |
+| snap_email_eu_core | spatial grid | 920 us | 0.489 | 0.567 | Fastest useful approximation. |
+| snap_email_eu_core | Barnes-Hut theta 1.2 | 5978 us | 0.571 | 0.756 | Slower than exact here. |
+| snap_p2p_gnutella08 sampled | exact | 29018 us | 0.000 | 0.000 | Baseline too expensive per frame. |
+| snap_p2p_gnutella08 sampled | Barnes-Hut theta 1.0 | 17847 us | 0.669 | 0.828 | Speed win, high error. |
+| snap_p2p_gnutella08 sampled | spatial grid | 2737 us | 0.784 | 0.941 | Huge speed win, poor far field. |
+
+### Hypothesis 8: body organs approximate exact node repulsion cheaply
+
+Result: rejected.
+
+The first body-force organs do not approximate raw exact node repulsion. They
+add semantic pressure, so comparing them only against exact physical force makes
+them look bad, because they are intentionally changing the field.
+
+Doctrine:
+
+- Do not treat body forces as a direct approximation of exact all-node
+  repulsion.
+- Measure body forces with structural metrics: component separation, fold group
+  compactness, rank preservation, edge length variance, and camera-readable
+  body spacing.
+
+### Hypothesis 9: actual graph fixtures change the policy
+
+Result: confirmed.
+
+On real SNAP fixtures, exact remains viable around 1k nodes, spatial grid is a
+very strong local approximation, and Barnes-Hut begins to matter on the larger
+Gnutella sample. This matches the synthetic sweep direction, but the real graphs
+make the crossover less theoretical and more irritatingly specific.
+
+Doctrine:
+
+- Keep exact for small real graphs.
+- Use grid when local structure dominates and frame budget is tight.
+- Use Barnes-Hut for larger broad graphs where far-field structure matters.
+- Do not enable body organs by default as an "accuracy" optimization. They need
+  structure-quality metrics and likely multilevel coarse solving.
+
+### Next Organ Work
+
+The next battleground must score structure, not only force error:
+
+- fold group compactness before/after tick
+- distance between community centers
+- rank error versus Sugiyama target Y
+- edge length variance
+- bridge/articulation readability
+- node displacement from exact trajectory after N ticks
+
+The organs are real, but they are not proven useful yet. Good. Better a failed
+organ in a jar than one quietly installed in the patient.
+
 ## Second Sweep: More Knobs
 
 Date: 2026-05-07
