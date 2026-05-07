@@ -41,6 +41,33 @@ for node in result.nodes {
 }
 ```
 
+## 3D Layout
+
+Use `layout_3d` when the renderer has a real spatial scene, such as Bevy.
+Hierarchy stays on `Y`; organic spread happens across `X/Z`; grounding and
+depth forces keep the graph shallow instead of letting it become decorative fog.
+
+```rust
+use epiphany_graph_rs::{layout_3d, Graph, Layout3dConfig};
+
+let mut graph = Graph::new();
+let root = graph.add_node(1.0);
+let child = graph.add_node(1.0);
+
+graph.add_edge(root, child);
+
+let result = layout_3d(&graph, &Layout3dConfig::default());
+
+for node in result.nodes {
+    let [x, y, z] = node.as_xyz();
+    println!("{:?}: ({x}, {y}, {z}) rank={}", node.id, node.rank);
+}
+```
+
+For Bevy, map `NodeLayout3d::as_xyz()` directly into `Vec3::new(x, y, z)`.
+The crate does not depend on Bevy just to borrow its vector type; the layout
+core stays small and renderer-agnostic.
+
 ## Notes
 
 The first release favors a small deterministic core over a sprawling layout

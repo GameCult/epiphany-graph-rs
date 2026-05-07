@@ -112,6 +112,39 @@ impl Default for LayoutConfig {
     }
 }
 
+/// Tunable parameters for hybrid 3D layout.
+#[derive(Clone, Debug)]
+pub struct Layout3dConfig {
+    /// Shared 2D-like force parameters.
+    pub base: LayoutConfig,
+    /// Initial same-rank depth spacing on the Z axis.
+    pub depth_gap: f32,
+    /// Force pulling nodes toward the ground plane.
+    ///
+    /// Rank pressure still owns hierarchy on Y. Ground strength simply keeps
+    /// the whole structure from drifting into needless altitude.
+    pub ground_strength: f32,
+    /// Force pulling nodes back toward a shallow Z envelope.
+    pub depth_strength: f32,
+    /// Extra multiplier for horizontal-plane repulsion.
+    pub horizontal_repulsion: f32,
+    /// Extra multiplier for vertical repulsion.
+    pub vertical_repulsion: f32,
+}
+
+impl Default for Layout3dConfig {
+    fn default() -> Self {
+        Self {
+            base: LayoutConfig::default(),
+            depth_gap: 56.0,
+            ground_strength: 0.015,
+            depth_strength: 0.025,
+            horizontal_repulsion: 1.0,
+            vertical_repulsion: 0.35,
+        }
+    }
+}
+
 /// Output for one laid-out node.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeLayout {
@@ -126,6 +159,32 @@ pub struct NodeLayout {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     pub nodes: Vec<NodeLayout>,
+    pub constraints: ConstraintSet,
+}
+
+/// Output for one laid-out 3D node.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodeLayout3d {
+    pub id: NodeId,
+    pub x: f32,
+    /// Hierarchy axis. Higher values are deeper Sugiyama ranks.
+    pub y: f32,
+    pub z: f32,
+    pub rank: usize,
+    pub order: usize,
+}
+
+impl NodeLayout3d {
+    /// Return coordinates in the same order Bevy's `Vec3::new` expects.
+    pub fn as_xyz(self) -> [f32; 3] {
+        [self.x, self.y, self.z]
+    }
+}
+
+/// Full 3D layout result plus generated Sugiyama-derived constraints.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Layout3d {
+    pub nodes: Vec<NodeLayout3d>,
     pub constraints: ConstraintSet,
 }
 
@@ -187,6 +246,42 @@ pub fn layout(graph: &Graph, config: &LayoutConfig) -> Layout {
     nodes.sort_by_key(|node| node.id.0);
 
     Layout { nodes, constraints }
+}
+
+/// Compute a hybrid 3D layout.
+///
+/// Sugiyama rank pressure acts on Y. Organic force relaxation primarily spreads
+/// nodes across X/Z, while ground and depth forces keep the structure shallow
+/// enough to read in a 3D scene.
+pub fn layout_3d(graph: &Graph, config: &Layout3dConfig) -> Layout3d {
+    let n = graph.node_count();
+    if n == 0 {
+        return Layout3d {
+            nodes: Vec::new(),
+            constraints: ConstraintSet::default(),
+        };
+    }
+
+    let ranks = assign_ranks(graph);
+    let orders = order_ranks(graph, &ranks);
+    let constraints = build_constraints(graph, &ranks, &orders, &config.base);
+    let mut positions = initial_positions_3d(&ranks, &orders, config);
+
+    relax_3d(graph, &constraints, config, &mut positions);
+
+    let mut nodes = (0..n)
+        .map(|idx| NodeLayout3d {
+            id: NodeId(idx),
+            x: positions[idx].0,
+            y: positions[idx].1,
+            z: positions[idx].2,
+            rank: ranks[idx],
+            order: orders[idx],
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by_key(|node| node.id.0);
+
+    Layout3d { nodes, constraints }
 }
 
 fn assign_ranks(graph: &Graph) -> Vec<usize> {
@@ -372,6 +467,26 @@ fn initial_positions(ranks: &[usize], orders: &[usize], config: &LayoutConfig) -
         .collect()
 }
 
+fn initial_positions_3d(
+    ranks: &[usize],
+    orders: &[usize],
+    config: &Layout3dConfig,
+) -> Vec<(f32, f32, f32)> {
+    ranks
+        .iter()
+        .zip(orders.iter())
+        .map(|(&rank, &order)| {
+            let parity = if order % 2 == 0 { 1.0 } else { -1.0 };
+            let depth_ring = (order / 2) as f32 + 1.0;
+            (
+                order as f32 * config.base.node_gap,
+                rank as f32 * config.base.rank_gap,
+                parity * depth_ring * config.depth_gap,
+            )
+        })
+        .collect()
+}
+
 fn relax(
     graph: &Graph,
     constraints: &ConstraintSet,
@@ -397,6 +512,33 @@ fn relax(
     }
 }
 
+fn relax_3d(
+    graph: &Graph,
+    constraints: &ConstraintSet,
+    config: &Layout3dConfig,
+    positions: &mut [(f32, f32, f32)],
+) {
+    let n = graph.node_count();
+    let mut forces = vec![(0.0f32, 0.0f32, 0.0f32); n];
+
+    for iter in 0..config.base.iterations {
+        forces.fill((0.0, 0.0, 0.0));
+
+        apply_repulsion_3d(positions, &mut forces, config);
+        apply_springs_3d(graph, positions, &mut forces, config);
+        apply_constraints_3d(constraints, positions, &mut forces, config);
+        apply_grounding_3d(positions, &mut forces, config);
+
+        let cooling = 1.0 - (iter as f32 / config.base.iterations.max(1) as f32);
+        let step = config.base.step_size * cooling.max(0.08);
+        for (position, force) in positions.iter_mut().zip(forces.iter()) {
+            position.0 += clamp(force.0, -24.0, 24.0) * step;
+            position.1 += clamp(force.1, -24.0, 24.0) * step;
+            position.2 += clamp(force.2, -24.0, 24.0) * step;
+        }
+    }
+}
+
 fn apply_repulsion(positions: &[(f32, f32)], forces: &mut [(f32, f32)], strength: f32) {
     for a in 0..positions.len() {
         for b in (a + 1)..positions.len() {
@@ -411,6 +553,32 @@ fn apply_repulsion(positions: &[(f32, f32)], forces: &mut [(f32, f32)], strength
             forces[a].1 += fy;
             forces[b].0 -= fx;
             forces[b].1 -= fy;
+        }
+    }
+}
+
+fn apply_repulsion_3d(
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    for a in 0..positions.len() {
+        for b in (a + 1)..positions.len() {
+            let dx = positions[a].0 - positions[b].0;
+            let dy = positions[a].1 - positions[b].1;
+            let dz = positions[a].2 - positions[b].2;
+            let dist2 = (dx * dx + dy * dy + dz * dz).max(0.01);
+            let dist = dist2.sqrt();
+            let magnitude = config.base.repulsion_strength / dist2;
+            let fx = dx / dist * magnitude * config.horizontal_repulsion;
+            let fy = dy / dist * magnitude * config.vertical_repulsion;
+            let fz = dz / dist * magnitude * config.horizontal_repulsion;
+            forces[a].0 += fx;
+            forces[a].1 += fy;
+            forces[a].2 += fz;
+            forces[b].0 -= fx;
+            forces[b].1 -= fy;
+            forces[b].2 -= fz;
         }
     }
 }
@@ -435,6 +603,33 @@ fn apply_springs(
         forces[a].1 += fy;
         forces[b].0 -= fx;
         forces[b].1 -= fy;
+    }
+}
+
+fn apply_springs_3d(
+    graph: &Graph,
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    for &(source, target) in graph.edges() {
+        let a = source.0;
+        let b = target.0;
+        let dx = positions[b].0 - positions[a].0;
+        let dy = positions[b].1 - positions[a].1;
+        let dz = positions[b].2 - positions[a].2;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.01);
+        let delta = dist - config.base.edge_length;
+        let magnitude = delta * config.base.spring_strength;
+        let fx = dx / dist * magnitude;
+        let fy = dy / dist * magnitude;
+        let fz = dz / dist * magnitude;
+        forces[a].0 += fx;
+        forces[a].1 += fy;
+        forces[a].2 += fz;
+        forces[b].0 -= fx;
+        forces[b].1 -= fy;
+        forces[b].2 -= fz;
     }
 }
 
@@ -490,6 +685,73 @@ fn apply_constraints(
     }
 }
 
+fn apply_constraints_3d(
+    constraints: &ConstraintSet,
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    for constraint in &constraints.ranks {
+        let node = constraint.node.0;
+        forces[node].1 += (constraint.target_y - positions[node].1) * config.base.rank_strength;
+    }
+
+    for constraint in &constraints.orders {
+        let left = constraint.left.0;
+        let right = constraint.right.0;
+        let gap = positions[right].0 - positions[left].0;
+        if gap < constraint.min_gap {
+            let push = (constraint.min_gap - gap) * 0.5 * config.base.order_strength;
+            forces[left].0 -= push;
+            forces[right].0 += push;
+        }
+    }
+
+    for constraint in &constraints.edge_directions {
+        let source = constraint.source.0;
+        let target = constraint.target.0;
+        let delta = positions[target].1 - positions[source].1;
+        if delta < constraint.min_delta_y {
+            let push = (constraint.min_delta_y - delta) * 0.5 * config.base.edge_direction_strength;
+            forces[source].1 -= push;
+            forces[target].1 += push;
+        }
+    }
+
+    for constraint in &constraints.orders {
+        let left = constraint.left.0;
+        let right = constraint.right.0;
+        let dx = positions[right].0 - positions[left].0;
+        let dy = positions[right].1 - positions[left].1;
+        let dz = positions[right].2 - positions[left].2;
+        let min_dist = constraint.min_gap * 0.75;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.01);
+        if dist < min_dist {
+            let push = (min_dist - dist) * config.base.collision_strength;
+            let fx = dx / dist * push;
+            let fy = dy / dist * push;
+            let fz = dz / dist * push;
+            forces[left].0 -= fx;
+            forces[left].1 -= fy;
+            forces[left].2 -= fz;
+            forces[right].0 += fx;
+            forces[right].1 += fy;
+            forces[right].2 += fz;
+        }
+    }
+}
+
+fn apply_grounding_3d(
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    for (position, force) in positions.iter().zip(forces.iter_mut()) {
+        force.1 -= position.1 * config.ground_strength;
+        force.2 -= position.2 * config.depth_strength;
+    }
+}
+
 fn clamp(value: f32, min: f32, max: f32) -> f32 {
     value.max(min).min(max)
 }
@@ -534,6 +796,33 @@ mod tests {
     fn empty_graph_layout_is_empty() {
         let graph = Graph::new();
         let result = layout(&graph, &LayoutConfig::default());
+
+        assert!(result.nodes.is_empty());
+        assert!(result.constraints.ranks.is_empty());
+    }
+
+    #[test]
+    fn layout_3d_uses_y_for_hierarchy_and_z_for_depth() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(1.0);
+        let b = graph.add_node(1.0);
+        let c = graph.add_node(1.0);
+        graph.add_edge(a, b);
+        graph.add_edge(a, c);
+
+        let result = layout_3d(&graph, &Layout3dConfig::default());
+
+        assert_eq!(result.nodes[a.0].rank, 0);
+        assert_eq!(result.nodes[b.0].rank, 1);
+        assert_eq!(result.nodes[c.0].rank, 1);
+        assert!(result.nodes[b.0].y > result.nodes[a.0].y);
+        assert!(result.nodes.iter().any(|node| node.z.abs() > 0.0));
+    }
+
+    #[test]
+    fn empty_3d_graph_layout_is_empty() {
+        let graph = Graph::new();
+        let result = layout_3d(&graph, &Layout3dConfig::default());
 
         assert!(result.nodes.is_empty());
         assert!(result.constraints.ranks.is_empty());
