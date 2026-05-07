@@ -153,6 +153,10 @@ pub struct Layout3dConfig {
     pub grid_cell_size: f32,
     /// Number of neighboring cells searched around each node.
     pub grid_radius: i32,
+    /// Barnes-Hut opening angle. Lower is more accurate; higher is faster.
+    pub barnes_hut_theta: f32,
+    /// Maximum Barnes-Hut octree depth.
+    pub barnes_hut_max_depth: usize,
 }
 
 impl Default for Layout3dConfig {
@@ -172,9 +176,11 @@ impl Default for Layout3dConfig {
             community_cohesion_strength: 0.025,
             core_anchor_strength: 0.018,
             clustering_cohesion_strength: 0.02,
-            repulsion_mode: RepulsionMode::SpatialGrid,
+            repulsion_mode: RepulsionMode::BarnesHut,
             grid_cell_size: 180.0,
             grid_radius: 1,
+            barnes_hut_theta: 0.65,
+            barnes_hut_max_depth: 24,
         }
     }
 }
@@ -183,8 +189,10 @@ impl Default for Layout3dConfig {
 pub enum RepulsionMode {
     /// Exact all-pairs repulsion. Best for quality on small graphs.
     Exact,
-    /// Approximate local repulsion through a uniform spatial grid.
+    /// Barnes-Hut octree approximation. Best default for realtime 3D layouts.
     #[default]
+    BarnesHut,
+    /// Approximate local repulsion through a uniform spatial grid.
     SpatialGrid,
 }
 
@@ -339,6 +347,9 @@ impl Layout3dSolver {
         match self.config.repulsion_mode {
             RepulsionMode::Exact => {
                 apply_repulsion_3d_exact(&self.positions, &mut self.forces, &self.config)
+            }
+            RepulsionMode::BarnesHut => {
+                apply_repulsion_3d_barnes_hut(&self.positions, &mut self.forces, &self.config)
             }
             RepulsionMode::SpatialGrid => {
                 apply_repulsion_3d_grid(&self.positions, &mut self.forces, &self.config)
@@ -1659,6 +1670,242 @@ fn apply_repulsion_3d_exact(
     }
 }
 
+fn apply_repulsion_3d_barnes_hut(
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    if positions.len() < 2 {
+        return;
+    }
+
+    let tree = BarnesHutTree::new(positions, config.barnes_hut_max_depth);
+    let theta = config.barnes_hut_theta.max(0.01);
+    for target in 0..positions.len() {
+        tree.apply_force(target, theta, positions, forces, config);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BarnesHutTree {
+    nodes: Vec<BarnesHutNode>,
+}
+
+impl BarnesHutTree {
+    fn new(positions: &[(f32, f32, f32)], max_depth: usize) -> Self {
+        let (center, half_size) = barnes_hut_bounds(positions);
+        let mut tree = Self {
+            nodes: vec![BarnesHutNode::new(center, half_size)],
+        };
+
+        for index in 0..positions.len() {
+            tree.insert(0, index, positions, 0, max_depth);
+        }
+
+        tree
+    }
+
+    fn insert(
+        &mut self,
+        node_index: usize,
+        body: usize,
+        positions: &[(f32, f32, f32)],
+        depth: usize,
+        max_depth: usize,
+    ) {
+        self.nodes[node_index].add_mass(positions[body]);
+
+        if self.nodes[node_index].is_leaf()
+            && (self.nodes[node_index].bodies.is_empty() || depth >= max_depth)
+        {
+            self.nodes[node_index].bodies.push(body);
+            return;
+        }
+
+        if self.nodes[node_index].is_leaf() {
+            let existing = std::mem::take(&mut self.nodes[node_index].bodies);
+            self.subdivide(node_index);
+            for old_body in existing {
+                let child = self.child_for_body(node_index, positions[old_body]);
+                self.insert(child, old_body, positions, depth + 1, max_depth);
+            }
+        }
+
+        let child = self.child_for_body(node_index, positions[body]);
+        self.insert(child, body, positions, depth + 1, max_depth);
+    }
+
+    fn subdivide(&mut self, node_index: usize) {
+        let center = self.nodes[node_index].center;
+        let child_half = self.nodes[node_index].half_size * 0.5;
+        let mut children = [None; 8];
+
+        for (slot, child) in children.iter_mut().enumerate() {
+            let offset = (
+                if slot & 1 == 0 {
+                    -child_half
+                } else {
+                    child_half
+                },
+                if slot & 2 == 0 {
+                    -child_half
+                } else {
+                    child_half
+                },
+                if slot & 4 == 0 {
+                    -child_half
+                } else {
+                    child_half
+                },
+            );
+            let child_center = (
+                center.0 + offset.0,
+                center.1 + offset.1,
+                center.2 + offset.2,
+            );
+            let child_index = self.nodes.len();
+            self.nodes
+                .push(BarnesHutNode::new(child_center, child_half));
+            *child = Some(child_index);
+        }
+
+        self.nodes[node_index].children = children;
+    }
+
+    fn child_for_body(&self, node_index: usize, position: (f32, f32, f32)) -> usize {
+        let node = &self.nodes[node_index];
+        let mut slot = 0usize;
+        if position.0 >= node.center.0 {
+            slot |= 1;
+        }
+        if position.1 >= node.center.1 {
+            slot |= 2;
+        }
+        if position.2 >= node.center.2 {
+            slot |= 4;
+        }
+        node.children[slot].unwrap_or(node_index)
+    }
+
+    fn apply_force(
+        &self,
+        target: usize,
+        theta: f32,
+        positions: &[(f32, f32, f32)],
+        forces: &mut [(f32, f32, f32)],
+        config: &Layout3dConfig,
+    ) {
+        self.apply_node_force(0, target, theta, positions, forces, config);
+    }
+
+    fn apply_node_force(
+        &self,
+        node_index: usize,
+        target: usize,
+        theta: f32,
+        positions: &[(f32, f32, f32)],
+        forces: &mut [(f32, f32, f32)],
+        config: &Layout3dConfig,
+    ) {
+        let node = &self.nodes[node_index];
+        if node.mass == 0 {
+            return;
+        }
+
+        if node.is_leaf() {
+            for &body in &node.bodies {
+                if body != target {
+                    apply_pair_repulsion_3d(target, body, positions, forces, config);
+                }
+            }
+            return;
+        }
+
+        let target_position = positions[target];
+        let dx = target_position.0 - node.center_of_mass.0;
+        let dy = target_position.1 - node.center_of_mass.1;
+        let dz = target_position.2 - node.center_of_mass.2;
+        let distance = (dx * dx + dy * dy + dz * dz).sqrt().max(0.01);
+        let width = node.half_size * 2.0;
+
+        if !node.contains(target_position) && width / distance < theta {
+            apply_aggregate_repulsion_3d(target, node, positions, forces, config);
+            return;
+        }
+
+        for child in node.children.iter().flatten() {
+            self.apply_node_force(*child, target, theta, positions, forces, config);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BarnesHutNode {
+    center: (f32, f32, f32),
+    half_size: f32,
+    mass: usize,
+    center_of_mass: (f32, f32, f32),
+    children: [Option<usize>; 8],
+    bodies: Vec<usize>,
+}
+
+impl BarnesHutNode {
+    fn new(center: (f32, f32, f32), half_size: f32) -> Self {
+        Self {
+            center,
+            half_size,
+            mass: 0,
+            center_of_mass: (0.0, 0.0, 0.0),
+            children: [None; 8],
+            bodies: Vec::new(),
+        }
+    }
+
+    fn add_mass(&mut self, position: (f32, f32, f32)) {
+        let old_mass = self.mass as f32;
+        let new_mass = old_mass + 1.0;
+        self.center_of_mass.0 = (self.center_of_mass.0 * old_mass + position.0) / new_mass;
+        self.center_of_mass.1 = (self.center_of_mass.1 * old_mass + position.1) / new_mass;
+        self.center_of_mass.2 = (self.center_of_mass.2 * old_mass + position.2) / new_mass;
+        self.mass += 1;
+    }
+
+    fn is_leaf(&self) -> bool {
+        self.children.iter().all(Option::is_none)
+    }
+
+    fn contains(&self, position: (f32, f32, f32)) -> bool {
+        position.0 >= self.center.0 - self.half_size
+            && position.0 <= self.center.0 + self.half_size
+            && position.1 >= self.center.1 - self.half_size
+            && position.1 <= self.center.1 + self.half_size
+            && position.2 >= self.center.2 - self.half_size
+            && position.2 <= self.center.2 + self.half_size
+    }
+}
+
+fn barnes_hut_bounds(positions: &[(f32, f32, f32)]) -> ((f32, f32, f32), f32) {
+    let mut min = positions[0];
+    let mut max = positions[0];
+
+    for &position in positions.iter().skip(1) {
+        min.0 = min.0.min(position.0);
+        min.1 = min.1.min(position.1);
+        min.2 = min.2.min(position.2);
+        max.0 = max.0.max(position.0);
+        max.1 = max.1.max(position.1);
+        max.2 = max.2.max(position.2);
+    }
+
+    let center = (
+        (min.0 + max.0) * 0.5,
+        (min.1 + max.1) * 0.5,
+        (min.2 + max.2) * 0.5,
+    );
+    let span = (max.0 - min.0).max(max.1 - min.1).max(max.2 - min.2);
+    (center, (span * 0.5).max(1.0) + 0.001)
+}
+
 fn apply_repulsion_3d_grid(
     positions: &[(f32, f32, f32)],
     forces: &mut [(f32, f32, f32)],
@@ -1703,6 +1950,24 @@ fn grid_cell(position: (f32, f32, f32), cell_size: f32) -> (i32, i32, i32) {
         (position.1 / cell_size).floor() as i32,
         (position.2 / cell_size).floor() as i32,
     )
+}
+
+fn apply_aggregate_repulsion_3d(
+    target: usize,
+    node: &BarnesHutNode,
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    let dx = positions[target].0 - node.center_of_mass.0;
+    let dy = positions[target].1 - node.center_of_mass.1;
+    let dz = positions[target].2 - node.center_of_mass.2;
+    let dist2 = (dx * dx + dy * dy + dz * dz).max(0.01);
+    let dist = dist2.sqrt();
+    let magnitude = config.base.repulsion_strength * node.mass as f32 / dist2;
+    forces[target].0 += dx / dist * magnitude * config.horizontal_repulsion;
+    forces[target].1 += dy / dist * magnitude * config.vertical_repulsion;
+    forces[target].2 += dz / dist * magnitude * config.horizontal_repulsion;
 }
 
 fn apply_pair_repulsion_3d(
@@ -2091,6 +2356,40 @@ mod tests {
         graph.add_edge(a, b);
         let config = Layout3dConfig {
             repulsion_mode: RepulsionMode::Exact,
+            ..Layout3dConfig::default()
+        };
+
+        let mut solver = Layout3dSolver::new(graph, config);
+        solver.tick(2);
+
+        assert_eq!(solver.snapshot().nodes.len(), 2);
+    }
+
+    #[test]
+    fn barnes_hut_repulsion_mode_runs_as_default() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(1.0);
+        let b = graph.add_node(1.0);
+        let c = graph.add_node(1.0);
+        graph.add_edge(a, b);
+        graph.add_edge(b, c);
+
+        let mut solver = Layout3dSolver::new(graph, Layout3dConfig::default());
+        solver.tick(3);
+        let snapshot = solver.snapshot();
+
+        assert_eq!(snapshot.nodes.len(), 3);
+        assert_eq!(snapshot.constraints.ranks.len(), 3);
+    }
+
+    #[test]
+    fn spatial_grid_repulsion_mode_still_runs() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(1.0);
+        let b = graph.add_node(1.0);
+        graph.add_edge(a, b);
+        let config = Layout3dConfig {
+            repulsion_mode: RepulsionMode::SpatialGrid,
             ..Layout3dConfig::default()
         };
 

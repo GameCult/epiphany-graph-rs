@@ -98,13 +98,15 @@ bureaucratic head injury.
 
 `Layout3dConfig::repulsion_mode` controls the expensive part:
 
-- `RepulsionMode::SpatialGrid` is the default realtime path.
+- `RepulsionMode::BarnesHut` is the default realtime path.
+- `RepulsionMode::SpatialGrid` keeps a simpler local approximation available.
 - `RepulsionMode::Exact` keeps all-pairs repulsion for small graphs or quality
   comparisons.
 
-The grid path is approximate local repulsion, not Barnes-Hut. It is the first
-practical step toward interactive scale; large graphs still want multilevel
-coarsening and a better far-field approximation.
+Barnes-Hut uses an octree and `barnes_hut_theta` as the opening-angle knob.
+Lower theta values are more accurate; higher values are faster. Large graphs
+still want multilevel coarsening, because even good approximation does not make
+every visual decision worth rendering individually.
 
 ## Graph Analysis And Folding
 
@@ -164,6 +166,5 @@ The first release favors a small deterministic core over a sprawling layout
 cathedral. The public API exposes generated constraints so callers can inspect,
 reuse, tune, or replace the force relaxation phase later.
 
-The current repulsion pass is exact pairwise repulsion. That is simple and
-stable for modest graphs; larger graphs should move toward a Barnes-Hut or grid
-approximation before pretending heroism is a scalability plan.
+The realtime solver defaults to Barnes-Hut repulsion. Exact pairwise repulsion
+is still available for small graphs and quality comparisons.
