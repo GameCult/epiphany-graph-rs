@@ -85,6 +85,8 @@ Current state:
 - `RepulsionMode::Exact` remains available for small graphs and comparisons.
 - `repulsion_accuracy_sweep` and `solver_repulsion_accuracy_sweep` report
   absolute/relative error and elapsed time for tuning passes.
+- `TUNING_DOCTRINE.md` records preliminary supervised sweeps and the current
+  policy for exact, Barnes-Hut, grid, and future multilevel force categories.
 
 Source:
 https://doi.org/10.1371/journal.pone.0098679

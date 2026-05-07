@@ -202,7 +202,8 @@ for permission.
 
 See [RESEARCH.md](RESEARCH.md) for the paper trail and the next deeper cuts:
 multilevel coarsening, constrained stress, edge bundling, adaptive solvers, and
-layout memory.
+layout memory. See [TUNING_DOCTRINE.md](TUNING_DOCTRINE.md) for measured
+performance/accuracy tradeoffs and current tuning policy.
 
 ## Notes
 
