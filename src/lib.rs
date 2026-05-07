@@ -4,7 +4,8 @@
 //! ordering, and edge direction pressure. A deterministic force solver then
 //! relaxes those constraints alongside springs, repulsion, and collision.
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 
 /// Index of a node in a [`Graph`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -140,6 +141,12 @@ pub struct Layout3dConfig {
     pub cycle_fold_strength: f32,
     /// Force anchoring high-centrality nodes closer to their component center.
     pub centrality_anchor_strength: f32,
+    /// Force pulling label-propagation communities into local regions.
+    pub community_cohesion_strength: f32,
+    /// Force giving dense core nodes stronger horizontal anchoring.
+    pub core_anchor_strength: f32,
+    /// Force keeping high-clustering neighborhoods compact.
+    pub clustering_cohesion_strength: f32,
 }
 
 impl Default for Layout3dConfig {
@@ -156,6 +163,9 @@ impl Default for Layout3dConfig {
             bridge_hinge_strength: 0.025,
             cycle_fold_strength: 0.035,
             centrality_anchor_strength: 0.02,
+            community_cohesion_strength: 0.025,
+            core_anchor_strength: 0.018,
+            clustering_cohesion_strength: 0.02,
         }
     }
 }
@@ -210,12 +220,17 @@ pub struct Layout3d {
 pub struct GraphAnalysis {
     pub weak_components: Vec<Component>,
     pub strongly_connected_components: Vec<Component>,
+    pub biconnected_components: Vec<Component>,
+    pub communities: Vec<Component>,
+    pub core_shells: Vec<Component>,
     pub articulation_points: Vec<NodeId>,
     pub bridges: Vec<EdgeId>,
     pub node_metrics: Vec<NodeMetrics>,
     pub edge_roles: Vec<EdgeRole>,
     pub node_to_weak_component: Vec<usize>,
     pub node_to_strong_component: Vec<usize>,
+    pub node_to_community: Vec<usize>,
+    pub max_core: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -230,6 +245,10 @@ pub struct NodeMetrics {
     pub out_degree: usize,
     pub undirected_degree: usize,
     pub degree_centrality: f32,
+    pub core_number: usize,
+    pub local_clustering_coefficient: f32,
+    pub community_id: usize,
+    pub biconnected_component_count: usize,
     pub is_articulation: bool,
     pub is_cyclic: bool,
 }
@@ -259,6 +278,9 @@ pub struct FoldGroup {
 pub enum FoldGroupKind {
     WeakComponent,
     StrongComponent,
+    BiconnectedComponent,
+    Community,
+    CoreShell,
     Cycle,
 }
 
@@ -379,15 +401,26 @@ pub fn analyze(graph: &Graph) -> GraphAnalysis {
     let undirected = undirected_adjacency(graph);
     let weak_components = weak_components(&undirected);
     let (sccs, node_to_scc) = strongly_connected_components(&directed);
-    let (articulation_points, bridges) = articulation_points_and_bridges(&undirected);
+    let (articulation_points, bridges, biconnected_components) =
+        articulation_points_bridges_and_blocks(&undirected);
+    let core_numbers = core_numbers(&undirected);
+    let max_core = core_numbers.iter().copied().max().unwrap_or(0);
+    let core_shells = core_shells(&core_numbers);
+    let local_clustering = local_clustering_coefficients(&undirected);
+    let (communities, node_to_community) = label_propagation_communities(&undirected, 16);
+    let biconnected_counts = biconnected_component_counts(n, &biconnected_components);
     let edge_roles = classify_edges(graph, &node_to_scc, &bridges);
-    let node_metrics = node_metrics(
+    let node_metrics = node_metrics(MetricsInput {
         graph,
-        &undirected,
-        &articulation_points,
-        &sccs,
-        &node_to_scc,
-    );
+        undirected: &undirected,
+        articulation_points: &articulation_points,
+        sccs: &sccs,
+        node_to_scc: &node_to_scc,
+        core_numbers: &core_numbers,
+        local_clustering: &local_clustering,
+        node_to_community: &node_to_community,
+        biconnected_counts: &biconnected_counts,
+    });
     let mut node_to_weak_component = vec![0usize; n];
     for component in &weak_components {
         for node in &component.nodes {
@@ -398,12 +431,17 @@ pub fn analyze(graph: &Graph) -> GraphAnalysis {
     GraphAnalysis {
         weak_components,
         strongly_connected_components: sccs,
+        biconnected_components,
+        communities,
+        core_shells,
         articulation_points,
         bridges,
         node_metrics,
         edge_roles,
         node_to_weak_component,
         node_to_strong_component: node_to_scc,
+        node_to_community,
+        max_core,
     }
 }
 
@@ -579,9 +617,9 @@ fn strongly_connected_components(adjacency: &[Vec<usize>]) -> (Vec<Component>, V
     (tarjan.components, tarjan.node_to_component)
 }
 
-fn articulation_points_and_bridges(
+fn articulation_points_bridges_and_blocks(
     adjacency: &[Vec<(usize, EdgeId)>],
-) -> (Vec<NodeId>, Vec<EdgeId>) {
+) -> (Vec<NodeId>, Vec<EdgeId>, Vec<Component>) {
     struct Dfs<'a> {
         adjacency: &'a [Vec<(usize, EdgeId)>],
         time: usize,
@@ -590,6 +628,8 @@ fn articulation_points_and_bridges(
         low: Vec<usize>,
         articulation: Vec<bool>,
         bridges: Vec<EdgeId>,
+        edge_stack: Vec<EdgeId>,
+        blocks: Vec<Component>,
     }
 
     impl Dfs<'_> {
@@ -605,16 +645,23 @@ fn articulation_points_and_bridges(
                     continue;
                 }
                 if self.visited[next] {
+                    if self.discovery[next] < self.discovery[node] {
+                        self.edge_stack.push(edge);
+                    }
                     self.low[node] = self.low[node].min(self.discovery[next]);
                     continue;
                 }
 
                 child_count += 1;
+                self.edge_stack.push(edge);
                 self.visit(next, Some(edge));
                 self.low[node] = self.low[node].min(self.low[next]);
 
                 if parent_edge.is_some() && self.low[next] >= self.discovery[node] {
                     self.articulation[node] = true;
+                }
+                if self.low[next] >= self.discovery[node] {
+                    self.pop_block(edge);
                 }
                 if self.low[next] > self.discovery[node] {
                     self.bridges.push(edge);
@@ -623,6 +670,26 @@ fn articulation_points_and_bridges(
 
             if parent_edge.is_none() && child_count > 1 {
                 self.articulation[node] = true;
+            }
+        }
+
+        fn pop_block(&mut self, stop_edge: EdgeId) {
+            let mut nodes = Vec::new();
+            while let Some(edge) = self.edge_stack.pop() {
+                let (source, target) = endpoints_for_edge(self.adjacency, edge);
+                nodes.push(NodeId(source));
+                nodes.push(NodeId(target));
+                if edge == stop_edge {
+                    break;
+                }
+            }
+            nodes.sort_by_key(|node| node.0);
+            nodes.dedup();
+            if !nodes.is_empty() {
+                self.blocks.push(Component {
+                    id: self.blocks.len(),
+                    nodes,
+                });
             }
         }
     }
@@ -636,6 +703,8 @@ fn articulation_points_and_bridges(
         low: vec![0; n],
         articulation: vec![false; n],
         bridges: Vec::new(),
+        edge_stack: Vec::new(),
+        blocks: Vec::new(),
     };
 
     for node in 0..n {
@@ -651,7 +720,180 @@ fn articulation_points_and_bridges(
         .filter_map(|(idx, &is_articulation)| is_articulation.then_some(NodeId(idx)))
         .collect();
     dfs.bridges.sort_by_key(|edge| edge.0);
-    (articulation_points, dfs.bridges)
+    (articulation_points, dfs.bridges, dfs.blocks)
+}
+
+fn endpoints_for_edge(adjacency: &[Vec<(usize, EdgeId)>], edge: EdgeId) -> (usize, usize) {
+    for (source, edges) in adjacency.iter().enumerate() {
+        for &(target, candidate) in edges {
+            if candidate == edge && source <= target {
+                return (source, target);
+            }
+        }
+    }
+
+    for (source, edges) in adjacency.iter().enumerate() {
+        for &(target, candidate) in edges {
+            if candidate == edge {
+                return (source, target);
+            }
+        }
+    }
+
+    (0, 0)
+}
+
+fn core_numbers(adjacency: &[Vec<(usize, EdgeId)>]) -> Vec<usize> {
+    let n = adjacency.len();
+    let mut degree = adjacency.iter().map(Vec::len).collect::<Vec<_>>();
+    let mut core = vec![0usize; n];
+    let mut removed = vec![false; n];
+    let mut heap = BinaryHeap::new();
+
+    for (node, &node_degree) in degree.iter().enumerate() {
+        heap.push(Reverse((node_degree, node)));
+    }
+
+    while let Some(Reverse((candidate_degree, node))) = heap.pop() {
+        if removed[node] || candidate_degree != degree[node] {
+            continue;
+        }
+
+        removed[node] = true;
+        core[node] = candidate_degree;
+
+        for &(next, _) in &adjacency[node] {
+            if !removed[next] && degree[next] > candidate_degree {
+                degree[next] -= 1;
+                heap.push(Reverse((degree[next], next)));
+            }
+        }
+    }
+
+    core
+}
+
+fn core_shells(core_numbers: &[usize]) -> Vec<Component> {
+    let max_core = core_numbers.iter().copied().max().unwrap_or(0);
+    let mut shells = vec![Vec::new(); max_core + 1];
+    for (idx, &core) in core_numbers.iter().enumerate() {
+        shells[core].push(NodeId(idx));
+    }
+
+    shells
+        .into_iter()
+        .enumerate()
+        .filter_map(|(id, nodes)| (!nodes.is_empty()).then_some(Component { id, nodes }))
+        .collect()
+}
+
+fn local_clustering_coefficients(adjacency: &[Vec<(usize, EdgeId)>]) -> Vec<f32> {
+    let n = adjacency.len();
+    let mut marks = vec![false; n];
+    let mut coefficients = vec![0.0f32; n];
+
+    for node in 0..n {
+        let neighbors = adjacency[node]
+            .iter()
+            .map(|&(neighbor, _)| neighbor)
+            .collect::<Vec<_>>();
+        let degree = neighbors.len();
+        if degree < 2 {
+            continue;
+        }
+
+        for &neighbor in &neighbors {
+            marks[neighbor] = true;
+        }
+
+        let mut links = 0usize;
+        for &neighbor in &neighbors {
+            for &(candidate, _) in &adjacency[neighbor] {
+                if marks[candidate] {
+                    links += 1;
+                }
+            }
+        }
+
+        for &neighbor in &neighbors {
+            marks[neighbor] = false;
+        }
+
+        coefficients[node] = links as f32 / (degree * (degree - 1)) as f32;
+    }
+
+    coefficients
+}
+
+fn label_propagation_communities(
+    adjacency: &[Vec<(usize, EdgeId)>],
+    max_iterations: usize,
+) -> (Vec<Component>, Vec<usize>) {
+    let n = adjacency.len();
+    let mut labels = (0..n).collect::<Vec<_>>();
+    let mut counts = Vec::<(usize, usize)>::new();
+
+    for _ in 0..max_iterations {
+        let mut changed = false;
+        for node in 0..n {
+            counts.clear();
+            for &(neighbor, _) in &adjacency[node] {
+                let label = labels[neighbor];
+                if let Some((_, count)) = counts.iter_mut().find(|(seen, _)| *seen == label) {
+                    *count += 1;
+                } else {
+                    counts.push((label, 1));
+                }
+            }
+
+            if counts.is_empty() {
+                continue;
+            }
+
+            counts.sort_by_key(|&(label, count)| (Reverse(count), label));
+            let best_label = counts[0].0;
+            if labels[node] != best_label {
+                labels[node] = best_label;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    let mut unique = labels.clone();
+    unique.sort_unstable();
+    unique.dedup();
+
+    let mut node_to_community = vec![0usize; n];
+    let mut communities = unique
+        .iter()
+        .enumerate()
+        .map(|(id, _)| Component {
+            id,
+            nodes: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    for (node, label) in labels.iter().enumerate() {
+        let community = unique.binary_search(label).unwrap_or(0);
+        node_to_community[node] = community;
+        communities[community].nodes.push(NodeId(node));
+    }
+
+    (communities, node_to_community)
+}
+
+fn biconnected_component_counts(n: usize, components: &[Component]) -> Vec<usize> {
+    let mut counts = vec![0usize; n];
+    for component in components {
+        for node in &component.nodes {
+            counts[node.0] += 1;
+        }
+    }
+    counts
 }
 
 fn classify_edges(graph: &Graph, node_to_scc: &[usize], bridges: &[EdgeId]) -> Vec<EdgeRole> {
@@ -676,35 +918,41 @@ fn classify_edges(graph: &Graph, node_to_scc: &[usize], bridges: &[EdgeId]) -> V
     roles
 }
 
-fn node_metrics(
-    graph: &Graph,
-    undirected: &[Vec<(usize, EdgeId)>],
-    articulation_points: &[NodeId],
-    sccs: &[Component],
-    node_to_scc: &[usize],
-) -> Vec<NodeMetrics> {
-    let n = graph.node_count();
+struct MetricsInput<'a> {
+    graph: &'a Graph,
+    undirected: &'a [Vec<(usize, EdgeId)>],
+    articulation_points: &'a [NodeId],
+    sccs: &'a [Component],
+    node_to_scc: &'a [usize],
+    core_numbers: &'a [usize],
+    local_clustering: &'a [f32],
+    node_to_community: &'a [usize],
+    biconnected_counts: &'a [usize],
+}
+
+fn node_metrics(input: MetricsInput<'_>) -> Vec<NodeMetrics> {
+    let n = input.graph.node_count();
     let mut in_degree = vec![0usize; n];
     let mut out_degree = vec![0usize; n];
-    for &(source, target) in graph.edges() {
+    for &(source, target) in input.graph.edges() {
         out_degree[source.0] += 1;
         in_degree[target.0] += 1;
     }
 
     let mut articulation = vec![false; n];
-    for node in articulation_points {
+    for node in input.articulation_points {
         articulation[node.0] = true;
     }
 
-    let mut cyclic_scc = vec![false; sccs.len()];
-    for component in sccs {
+    let mut cyclic_scc = vec![false; input.sccs.len()];
+    for component in input.sccs {
         if component.nodes.len() > 1 {
             cyclic_scc[component.id] = true;
         }
     }
-    for &(source, target) in graph.edges() {
+    for &(source, target) in input.graph.edges() {
         if source == target {
-            cyclic_scc[node_to_scc[source.0]] = true;
+            cyclic_scc[input.node_to_scc[source.0]] = true;
         }
     }
 
@@ -713,10 +961,14 @@ fn node_metrics(
         .map(|idx| NodeMetrics {
             in_degree: in_degree[idx],
             out_degree: out_degree[idx],
-            undirected_degree: undirected[idx].len(),
-            degree_centrality: undirected[idx].len() as f32 / centrality_denominator,
+            undirected_degree: input.undirected[idx].len(),
+            degree_centrality: input.undirected[idx].len() as f32 / centrality_denominator,
+            core_number: input.core_numbers[idx],
+            local_clustering_coefficient: input.local_clustering[idx],
+            community_id: input.node_to_community[idx],
+            biconnected_component_count: input.biconnected_counts[idx],
             is_articulation: articulation[idx],
-            is_cyclic: cyclic_scc[node_to_scc[idx]],
+            is_cyclic: cyclic_scc[input.node_to_scc[idx]],
         })
         .collect()
 }
@@ -903,6 +1155,7 @@ fn relax_3d(
 ) {
     let n = graph.node_count();
     let mut forces = vec![(0.0f32, 0.0f32, 0.0f32); n];
+    let undirected = undirected_adjacency(graph);
 
     for iter in 0..config.base.iterations {
         forces.fill((0.0, 0.0, 0.0));
@@ -910,7 +1163,7 @@ fn relax_3d(
         apply_repulsion_3d(positions, &mut forces, config);
         apply_springs_3d(graph, positions, &mut forces, config);
         apply_constraints_3d(constraints, positions, &mut forces, config);
-        apply_structural_forces_3d(graph, analysis, positions, &mut forces, config);
+        apply_structural_forces_3d(graph, &undirected, analysis, positions, &mut forces, config);
         apply_grounding_3d(positions, &mut forces, config);
 
         let cooling = 1.0 - (iter as f32 / config.base.iterations.max(1) as f32);
@@ -925,6 +1178,7 @@ fn relax_3d(
 
 fn apply_structural_forces_3d(
     graph: &Graph,
+    undirected: &[Vec<(usize, EdgeId)>],
     analysis: &GraphAnalysis,
     positions: &[(f32, f32, f32)],
     forces: &mut [(f32, f32, f32)],
@@ -942,7 +1196,15 @@ fn apply_structural_forces_3d(
         forces,
         config.weak_component_cohesion_strength,
     );
+    apply_component_cohesion(
+        &analysis.communities,
+        positions,
+        forces,
+        config.community_cohesion_strength,
+    );
     apply_centrality_anchors(analysis, positions, forces, config);
+    apply_core_anchors(analysis, positions, forces, config);
+    apply_clustering_cohesion(graph, undirected, analysis, positions, forces, config);
     apply_cycle_folds(analysis, positions, forces, config);
     apply_bridge_hinges(graph, analysis, positions, forces, config);
 }
@@ -995,6 +1257,59 @@ fn apply_centrality_anchors(
             forces[idx].0 += (center[0] - positions[idx].0) * strength;
             forces[idx].2 += (center[2] - positions[idx].2) * strength;
         }
+    }
+}
+
+fn apply_core_anchors(
+    analysis: &GraphAnalysis,
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    if config.core_anchor_strength <= 0.0 || analysis.max_core == 0 {
+        return;
+    }
+
+    for component in &analysis.weak_components {
+        let center = component_center(&component.nodes, positions);
+        for node in &component.nodes {
+            let idx = node.0;
+            let core_ratio =
+                analysis.node_metrics[idx].core_number as f32 / analysis.max_core as f32;
+            let strength = config.core_anchor_strength * core_ratio * core_ratio;
+            forces[idx].0 += (center[0] - positions[idx].0) * strength;
+            forces[idx].2 += (center[2] - positions[idx].2) * strength;
+        }
+    }
+}
+
+fn apply_clustering_cohesion(
+    graph: &Graph,
+    adjacency: &[Vec<(usize, EdgeId)>],
+    analysis: &GraphAnalysis,
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    if config.clustering_cohesion_strength <= 0.0 {
+        return;
+    }
+
+    for node in 0..graph.node_count() {
+        let coefficient = analysis.node_metrics[node].local_clustering_coefficient;
+        if coefficient <= 0.0 || adjacency[node].len() < 2 {
+            continue;
+        }
+
+        let mut nodes = adjacency[node]
+            .iter()
+            .map(|&(neighbor, _)| NodeId(neighbor))
+            .collect::<Vec<_>>();
+        nodes.push(NodeId(node));
+        let center = component_center(&nodes, positions);
+        let strength = config.clustering_cohesion_strength * coefficient;
+        forces[node].0 += (center[0] - positions[node].0) * strength;
+        forces[node].2 += (center[2] - positions[node].2) * strength;
     }
 }
 
@@ -1106,6 +1421,53 @@ fn build_fold_groups(analysis: &GraphAnalysis, positions: &[(f32, f32, f32)]) ->
             component.nodes.clone(),
             positions,
             parent,
+        ));
+    }
+
+    for component in &analysis.biconnected_components {
+        if component.nodes.len() < 3 {
+            continue;
+        }
+        let parent = component
+            .nodes
+            .first()
+            .map(|node| analysis.node_to_weak_component[node.0]);
+        groups.push(fold_group(
+            groups.len(),
+            FoldGroupKind::BiconnectedComponent,
+            component.nodes.clone(),
+            positions,
+            parent,
+        ));
+    }
+
+    for component in &analysis.communities {
+        if component.nodes.len() < 2 {
+            continue;
+        }
+        let parent = component
+            .nodes
+            .first()
+            .map(|node| analysis.node_to_weak_component[node.0]);
+        groups.push(fold_group(
+            groups.len(),
+            FoldGroupKind::Community,
+            component.nodes.clone(),
+            positions,
+            parent,
+        ));
+    }
+
+    for component in &analysis.core_shells {
+        if component.nodes.len() < 2 {
+            continue;
+        }
+        groups.push(fold_group(
+            groups.len(),
+            FoldGroupKind::CoreShell,
+            component.nodes.clone(),
+            positions,
+            None,
         ));
     }
 
@@ -1471,6 +1833,14 @@ mod tests {
         assert!(analysis.articulation_points.contains(&c));
         assert!(analysis.bridges.contains(&bridge));
         assert_eq!(analysis.edge_roles[bridge.0], EdgeRole::Bridge);
+        assert!(analysis.biconnected_components.len() >= 2);
+        assert!(analysis.max_core >= 1);
+        assert!(analysis.node_metrics[a.0].core_number >= 2);
+        assert!(analysis.node_metrics[a.0].local_clustering_coefficient > 0.0);
+        assert_eq!(
+            analysis.node_metrics[c.0].biconnected_component_count,
+            analysis.biconnected_components.len()
+        );
     }
 
     #[test]
@@ -1502,6 +1872,18 @@ mod tests {
                 .fold_groups
                 .iter()
                 .any(|group| group.kind == FoldGroupKind::Cycle)
+        );
+        assert!(
+            result
+                .fold_groups
+                .iter()
+                .any(|group| group.kind == FoldGroupKind::Community)
+        );
+        assert!(
+            result
+                .fold_groups
+                .iter()
+                .any(|group| group.kind == FoldGroupKind::CoreShell)
         );
     }
 }

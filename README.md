@@ -78,9 +78,13 @@ The crate exposes `analyze(&graph)` for layout-independent structure reads:
 
 - weak components
 - strongly connected components
+- biconnected components
+- label-propagation communities
+- k-core shells
 - articulation points
 - bridge edges
 - per-node degree metrics
+- local clustering coefficients
 - edge roles
 - cyclic node flags
 
@@ -88,6 +92,9 @@ The crate exposes `analyze(&graph)` for layout-independent structure reads:
 
 - SCC cohesion folds cycles and tight feedback regions into local bodies.
 - weak component cohesion keeps broad regions visually legible.
+- community cohesion gives dense modules local territory.
+- k-core anchoring lets dense nuclei read differently from peripheral leaves.
+- local clustering cohesion tightens triangle-rich neighborhoods.
 - bridge hinges keep connector edges readable between bodies.
 - centrality anchoring keeps important nodes from drifting into decorative exile.
 - cycle folding uses depth so feedback does not have to lose every argument
@@ -107,10 +114,15 @@ for group in result.fold_groups {
 }
 ```
 
-Fold groups currently cover weak components, strongly connected components, and
-cycle bodies. They are meant to be useful handles for Bevy interactions:
-collapse a component, pulse a cycle, dim a subtree, or unfold a dense region
-without asking the raw node soup for permission.
+Fold groups currently cover weak components, strongly connected components,
+biconnected components, communities, core shells, and cycle bodies. They are
+meant to be useful handles for Bevy interactions: collapse a component, pulse a
+cycle, dim a subtree, or unfold a dense region without asking the raw node soup
+for permission.
+
+See [RESEARCH.md](RESEARCH.md) for the paper trail and the next deeper cuts:
+multilevel coarsening, constrained stress, edge bundling, adaptive solvers, and
+layout memory.
 
 ## Notes
 
