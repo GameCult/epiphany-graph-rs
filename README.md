@@ -108,6 +108,13 @@ Lower theta values are more accurate; higher values are faster. Large graphs
 still want multilevel coarsening, because even good approximation does not make
 every visual decision worth rendering individually.
 
+Additional scale knobs split local and global behavior:
+
+- `barnes_hut_near_radius` forces Barnes-Hut to recurse near the target instead
+  of aggregating local neighborhoods.
+- `near_repulsion_scale` controls exact pairwise/local repulsion.
+- `far_repulsion_scale` controls Barnes-Hut aggregate far-field repulsion.
+
 ## Accuracy Sweeps
 
 Use the repulsion accuracy sweep to compare approximation settings against exact
@@ -131,6 +138,7 @@ let reports = repulsion_accuracy_sweep(
         RepulsionAccuracyCandidate::barnes_hut(0.4),
         RepulsionAccuracyCandidate::barnes_hut(0.7),
         RepulsionAccuracyCandidate::barnes_hut(1.0),
+        RepulsionAccuracyCandidate::barnes_hut_tuned(1.0, 240.0, 0.85),
         RepulsionAccuracyCandidate::spatial_grid(180.0, 1),
     ],
 );

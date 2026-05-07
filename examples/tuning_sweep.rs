@@ -16,6 +16,12 @@ fn main() {
         RepulsionAccuracyCandidate::barnes_hut(0.80),
         RepulsionAccuracyCandidate::barnes_hut(1.00),
         RepulsionAccuracyCandidate::barnes_hut(1.20),
+        RepulsionAccuracyCandidate::barnes_hut_tuned(0.80, 120.0, 0.85),
+        RepulsionAccuracyCandidate::barnes_hut_tuned(0.80, 240.0, 1.00),
+        RepulsionAccuracyCandidate::barnes_hut_tuned(1.00, 120.0, 0.85),
+        RepulsionAccuracyCandidate::barnes_hut_tuned(1.00, 240.0, 1.00),
+        RepulsionAccuracyCandidate::barnes_hut_tuned(1.20, 120.0, 0.85),
+        RepulsionAccuracyCandidate::barnes_hut_tuned(1.20, 240.0, 1.00),
         RepulsionAccuracyCandidate::spatial_grid(120.0, 1),
         RepulsionAccuracyCandidate::spatial_grid(180.0, 1),
         RepulsionAccuracyCandidate::spatial_grid(240.0, 1),
@@ -23,7 +29,7 @@ fn main() {
     ];
 
     println!(
-        "dataset,n,mode,theta,cell,radius,elapsed_us,mean_abs,max_abs,mean_rel,rms_rel,max_rel"
+        "dataset,n,mode,theta,near_radius,far_scale,cell,radius,elapsed_us,mean_abs,max_abs,mean_rel,rms_rel,max_rel"
     );
 
     for (name, positions) in [
@@ -35,11 +41,13 @@ fn main() {
         let reports = repulsion_accuracy_sweep(&positions, &config, &candidates);
         for report in reports {
             println!(
-                "{},{},{},{:.2},{:.1},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                "{},{},{},{:.2},{:.1},{:.2},{:.1},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
                 name,
                 report.node_count,
                 mode_name(report.candidate.repulsion_mode),
                 report.candidate.barnes_hut_theta,
+                report.candidate.barnes_hut_near_radius,
+                report.candidate.far_repulsion_scale,
                 report.candidate.grid_cell_size,
                 report.candidate.grid_radius,
                 report.elapsed.as_micros(),

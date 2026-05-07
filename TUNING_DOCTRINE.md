@@ -210,3 +210,87 @@ Supervised tuning recommendation:
 The doctrine for now is simple: exact is the truth, Barnes-Hut is the large
 scale field, grid is local blunt force, and fold groups are the path to making
 large graphs readable without making every node audition for camera time.
+
+## Second Sweep: More Knobs
+
+Date: 2026-05-07
+
+New knobs:
+
+- `barnes_hut_near_radius`: prevents Barnes-Hut aggregation inside a local
+  radius, forcing recursion toward exact local behavior.
+- `near_repulsion_scale`: scales exact/local pairwise repulsion.
+- `far_repulsion_scale`: scales aggregate Barnes-Hut far-field repulsion.
+
+New candidates added:
+
+- Barnes-Hut theta `0.8`, `1.0`, `1.2`
+- near radius `120` or `240`
+- far scale `0.85` or `1.0`
+
+Representative second-pass results:
+
+| Dataset | Candidate | Time | Mean Rel Error | RMS Rel Error | Note |
+|---|---:|---:|---:|---:|---|
+| layered_dag_256 | exact | 178 us | 0.000 | 0.000 | Exact still wins small. |
+| layered_dag_256 | Barnes-Hut theta 1.0, near 180, far 1.0 | 556 us | 0.560 | 0.676 | Best plain Barnes-Hut balance here. |
+| layered_dag_256 | Barnes-Hut theta 1.0, near 240, far 1.0 | 644 us | 0.555 | 0.673 | Tiny accuracy gain, more cost. |
+| layered_dag_256 | grid 180/r2 | 452 us | 0.419 | 0.492 | Still better local approximation than Barnes-Hut. |
+| clustered_fold_512 | exact | 821 us | 0.000 | 0.000 | Exact still cheap. |
+| clustered_fold_512 | Barnes-Hut theta 1.2, near 120, far 0.85 | 1910 us | 0.916 | 0.946 | Damping far field helps a little, still poor. |
+| clustered_fold_512 | grid 240/r1 | 568 us | 0.087 | 0.110 | Best practical local folded-body candidate. |
+| uniform_cloud_1024 | exact | 3433 us | 0.000 | 0.000 | Exact remains viable. |
+| uniform_cloud_1024 | Barnes-Hut theta 1.2, near 240, far 1.0 | 2633 us | 0.476 | 0.658 | Speed win, high error. |
+| uniform_cloud_1024 | Barnes-Hut theta 1.2, near 120, far 0.85 | 3270 us | 0.475 | 0.686 | Far damping did not clearly help. |
+| uniform_cloud_4096 | exact | 70970 us | 0.000 | 0.000 | Too slow per frame. |
+| uniform_cloud_4096 | Barnes-Hut theta 1.2, near 180, far 1.0 | 18528 us | 0.343 | 0.486 | Best broad large graph speed/accuracy point here. |
+| uniform_cloud_4096 | Barnes-Hut theta 1.0, near 180, far 1.0 | 28078 us | 0.336 | 0.472 | More time, modest accuracy gain. |
+| uniform_cloud_4096 | Barnes-Hut theta 1.0, near 120, far 0.85 | 20274 us | 0.366 | 0.517 | Far damping worsened force accuracy. |
+| uniform_cloud_4096 | Barnes-Hut theta 1.0, near 240, far 1.0 | 36039 us | 0.350 | 0.483 | Larger near radius cost more without enough gain. |
+
+### Hypothesis 5: larger local exact radius improves Barnes-Hut enough to pay
+
+Result: mostly rejected.
+
+Increasing `barnes_hut_near_radius` from `180` to `240` often increased runtime
+with only tiny accuracy improvement, and sometimes worsened mean relative error.
+The current implementation already recurses for target-containing octants, so a
+large near radius is not a free lunch. It is lunch with a service charge and
+slightly cold fries.
+
+Doctrine:
+
+- Keep `barnes_hut_near_radius = 180.0` as the default.
+- Sweep near radius on real dense graphs, but do not raise it globally.
+
+### Hypothesis 6: reducing far-field scale preserves local accuracy
+
+Result: rejected for force-ground-truth accuracy.
+
+`far_repulsion_scale = 0.85` sometimes reduced absolute force magnitude, but it
+did not improve relative error against exact all-pairs ground truth. On broad
+4096-node clouds it worsened mean/RMS relative error compared to far scale `1.0`.
+
+Doctrine:
+
+- Keep `far_repulsion_scale = 1.0` for physical force approximation.
+- Use far-field scale as an artistic/readability control later, not as an
+  accuracy knob.
+
+### Hypothesis 7: exact/grid/Barnes-Hut should be selected per force category
+
+Result: strengthened.
+
+The second sweep made the split more obvious:
+
+- exact wins small graphs.
+- grid wins dense local folded bodies.
+- Barnes-Hut wins large broad far-field layouts.
+- far-field damping and larger near radius do not replace category separation.
+
+Doctrine:
+
+- Add a hybrid repulsion architecture next:
+  local exact/grid inside fold groups and near neighborhoods;
+  Barnes-Hut between distant bodies;
+  coarse fold-group repulsion for global structure.

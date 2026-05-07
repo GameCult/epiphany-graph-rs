@@ -87,6 +87,8 @@ Current state:
   absolute/relative error and elapsed time for tuning passes.
 - `TUNING_DOCTRINE.md` records preliminary supervised sweeps and the current
   policy for exact, Barnes-Hut, grid, and future multilevel force categories.
+- Local/global repulsion knobs now expose Barnes-Hut near radius, local pair
+  scale, and aggregate far-field scale.
 
 Source:
 https://doi.org/10.1371/journal.pone.0098679

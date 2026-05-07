@@ -158,6 +158,12 @@ pub struct Layout3dConfig {
     pub barnes_hut_theta: f32,
     /// Maximum Barnes-Hut octree depth.
     pub barnes_hut_max_depth: usize,
+    /// Radius inside which Barnes-Hut must recurse instead of aggregating.
+    pub barnes_hut_near_radius: f32,
+    /// Scale for exact pairwise/local repulsion.
+    pub near_repulsion_scale: f32,
+    /// Scale for Barnes-Hut aggregate far-field repulsion.
+    pub far_repulsion_scale: f32,
 }
 
 impl Default for Layout3dConfig {
@@ -182,6 +188,9 @@ impl Default for Layout3dConfig {
             grid_radius: 1,
             barnes_hut_theta: 0.65,
             barnes_hut_max_depth: 24,
+            barnes_hut_near_radius: 180.0,
+            near_repulsion_scale: 1.0,
+            far_repulsion_scale: 1.0,
         }
     }
 }
@@ -204,6 +213,9 @@ pub struct RepulsionAccuracyCandidate {
     pub barnes_hut_theta: f32,
     pub grid_cell_size: f32,
     pub grid_radius: i32,
+    pub barnes_hut_near_radius: f32,
+    pub near_repulsion_scale: f32,
+    pub far_repulsion_scale: f32,
 }
 
 impl RepulsionAccuracyCandidate {
@@ -213,6 +225,21 @@ impl RepulsionAccuracyCandidate {
             barnes_hut_theta: theta,
             grid_cell_size: Layout3dConfig::default().grid_cell_size,
             grid_radius: Layout3dConfig::default().grid_radius,
+            barnes_hut_near_radius: Layout3dConfig::default().barnes_hut_near_radius,
+            near_repulsion_scale: Layout3dConfig::default().near_repulsion_scale,
+            far_repulsion_scale: Layout3dConfig::default().far_repulsion_scale,
+        }
+    }
+
+    pub fn barnes_hut_tuned(theta: f32, near_radius: f32, far_scale: f32) -> Self {
+        Self {
+            repulsion_mode: RepulsionMode::BarnesHut,
+            barnes_hut_theta: theta,
+            grid_cell_size: Layout3dConfig::default().grid_cell_size,
+            grid_radius: Layout3dConfig::default().grid_radius,
+            barnes_hut_near_radius: near_radius,
+            near_repulsion_scale: Layout3dConfig::default().near_repulsion_scale,
+            far_repulsion_scale: far_scale,
         }
     }
 
@@ -222,6 +249,9 @@ impl RepulsionAccuracyCandidate {
             barnes_hut_theta: Layout3dConfig::default().barnes_hut_theta,
             grid_cell_size: cell_size,
             grid_radius: radius,
+            barnes_hut_near_radius: Layout3dConfig::default().barnes_hut_near_radius,
+            near_repulsion_scale: Layout3dConfig::default().near_repulsion_scale,
+            far_repulsion_scale: Layout3dConfig::default().far_repulsion_scale,
         }
     }
 
@@ -231,6 +261,9 @@ impl RepulsionAccuracyCandidate {
             barnes_hut_theta: Layout3dConfig::default().barnes_hut_theta,
             grid_cell_size: Layout3dConfig::default().grid_cell_size,
             grid_radius: Layout3dConfig::default().grid_radius,
+            barnes_hut_near_radius: Layout3dConfig::default().barnes_hut_near_radius,
+            near_repulsion_scale: Layout3dConfig::default().near_repulsion_scale,
+            far_repulsion_scale: Layout3dConfig::default().far_repulsion_scale,
         }
     }
 }
@@ -619,6 +652,9 @@ fn repulsion_accuracy_sweep_tuples(
             candidate_config.barnes_hut_theta = candidate.barnes_hut_theta;
             candidate_config.grid_cell_size = candidate.grid_cell_size;
             candidate_config.grid_radius = candidate.grid_radius;
+            candidate_config.barnes_hut_near_radius = candidate.barnes_hut_near_radius;
+            candidate_config.near_repulsion_scale = candidate.near_repulsion_scale;
+            candidate_config.far_repulsion_scale = candidate.far_repulsion_scale;
 
             let started = Instant::now();
             let forces = compute_repulsion_forces(positions, &candidate_config);
@@ -1992,7 +2028,10 @@ impl BarnesHutTree {
         let distance = (dx * dx + dy * dy + dz * dz).sqrt().max(0.01);
         let width = node.half_size * 2.0;
 
-        if !node.contains(target_position) && width / distance < theta {
+        let outside_local_radius =
+            config.barnes_hut_near_radius <= 0.0 || distance > config.barnes_hut_near_radius;
+
+        if !node.contains(target_position) && outside_local_radius && width / distance < theta {
             apply_aggregate_repulsion_3d(target, node, positions, forces, config);
             return;
         }
@@ -2128,7 +2167,8 @@ fn apply_aggregate_repulsion_3d(
     let dz = positions[target].2 - node.center_of_mass.2;
     let dist2 = (dx * dx + dy * dy + dz * dz).max(0.01);
     let dist = dist2.sqrt();
-    let magnitude = config.base.repulsion_strength * node.mass as f32 / dist2;
+    let magnitude =
+        config.base.repulsion_strength * node.mass as f32 * config.far_repulsion_scale / dist2;
     forces[target].0 += dx / dist * magnitude * config.horizontal_repulsion;
     forces[target].1 += dy / dist * magnitude * config.vertical_repulsion;
     forces[target].2 += dz / dist * magnitude * config.horizontal_repulsion;
@@ -2146,7 +2186,7 @@ fn apply_pair_repulsion_3d(
     let dz = positions[a].2 - positions[b].2;
     let dist2 = (dx * dx + dy * dy + dz * dz).max(0.01);
     let dist = dist2.sqrt();
-    let magnitude = config.base.repulsion_strength / dist2;
+    let magnitude = config.base.repulsion_strength * config.near_repulsion_scale / dist2;
     let fx = dx / dist * magnitude * config.horizontal_repulsion;
     let fy = dy / dist * magnitude * config.vertical_repulsion;
     let fz = dz / dist * magnitude * config.horizontal_repulsion;
@@ -2604,6 +2644,16 @@ mod tests {
                 .iter()
                 .all(|report| report.mean_relative_error.is_finite())
         );
+    }
+
+    #[test]
+    fn tuned_barnes_hut_candidate_preserves_knobs() {
+        let candidate = RepulsionAccuracyCandidate::barnes_hut_tuned(1.0, 240.0, 0.85);
+
+        assert_eq!(candidate.repulsion_mode, RepulsionMode::BarnesHut);
+        assert_eq!(candidate.barnes_hut_theta, 1.0);
+        assert_eq!(candidate.barnes_hut_near_radius, 240.0);
+        assert_eq!(candidate.far_repulsion_scale, 0.85);
     }
 
     #[test]
