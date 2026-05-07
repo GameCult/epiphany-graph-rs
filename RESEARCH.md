@@ -91,6 +91,8 @@ Current state:
   scale, and aggregate far-field scale.
 - `organ_battleground` evaluates raw and body-aware force candidates on
   synthetic fixtures plus SNAP email/Gnutella datasets.
+- `evaluate_layout_quality` reports fold compactness, group separation, rank
+  error, edge length variance, and bridge length variance for snapshots.
 
 Source:
 https://doi.org/10.1371/journal.pone.0098679

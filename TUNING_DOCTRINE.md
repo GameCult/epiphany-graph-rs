@@ -307,6 +307,82 @@ The next battleground must score structure, not only force error:
 The organs are real, but they are not proven useful yet. Good. Better a failed
 organ in a jar than one quietly installed in the patient.
 
+## Third Sweep: Structure Metrics
+
+Date: 2026-05-07
+
+New metrics added via `evaluate_layout_quality`:
+
+- mean fold compactness
+- mean group separation
+- mean rank error
+- edge length mean and variance
+- bridge length mean and variance
+
+`organ_battleground` now emits both force-error metrics and structure metrics.
+
+Representative corrected results:
+
+| Dataset | Candidate | Force Time | Mean Rel Error | Fold Compactness | Group Separation | Rank Error | Note |
+|---|---:|---:|---:|---:|---:|---:|---|
+| synthetic_layered_512 | exact | 857 us | 0.000 | 61.660 | 0.029 | 128.258 | Baseline. |
+| synthetic_layered_512 | structured body exact 0.20/body far 0.50 | 1778 us | 5.075 | 61.380 | 0.045 | 127.906 | Structure metrics barely move. |
+| synthetic_clustered_1024 | exact | 3057 us | 0.000 | 910.741 | 2.258 | 539.089 | Baseline. |
+| synthetic_clustered_1024 | spatial grid | 1535 us | 0.491 | 910.741 | 2.258 | 539.090 | Fast, structurally similar after 32 ticks. |
+| snap_email_eu_core | exact | 2803 us | 0.000 | 1727.105 | 49.021 | 498.931 | Baseline. |
+| snap_email_eu_core | spatial grid | 709 us | 0.489 | 1727.129 | 48.816 | 498.956 | Big speed win; structure metrics nearly unchanged. |
+| snap_p2p_gnutella08 sampled | exact | 27859 us | 0.000 | 586.979 | 0.250 | 360.660 | Baseline. |
+| snap_p2p_gnutella08 sampled | Barnes-Hut theta 1.2 | 10555 us | 0.753 | 586.986 | 0.250 | 360.507 | Faster; metrics still too insensitive. |
+| snap_p2p_gnutella08 sampled | spatial grid | 2027 us | 0.784 | 586.958 | 0.250 | 360.940 | Very fast; structure metrics still barely move. |
+
+### Hypothesis 10: one short quality snapshot exposes organ benefits
+
+Result: rejected.
+
+After 32 ticks, fold compactness, group separation, rank error, and edge stats
+barely differ across candidates. That can mean two things:
+
+- the candidate forces are too weak or too entangled with the rest of the solver;
+- the current metrics need longer trajectory comparisons and normalized deltas.
+
+Probably both. Annoying, therefore useful.
+
+Doctrine:
+
+- Keep `evaluate_layout_quality`, but do not overinterpret one short snapshot.
+- Add before/after delta metrics.
+- Add N-tick trajectory comparisons against exact.
+- Normalize rank error by `rank_gap`, edge variance by mean edge length, and
+  group separation by group radii.
+- Run longer settle windows for structural candidates, likely 100-500 ticks.
+
+### Hypothesis 11: force error and structure quality are separate axes
+
+Result: confirmed.
+
+Spatial grid can have poor far-field force error while preserving short-window
+structure metrics. Body forces can worsen raw force error while intending to
+improve semantic shape. These are different scoreboards.
+
+Doctrine:
+
+- Force approximation sweeps decide physics fidelity and speed.
+- Structure sweeps decide visual readability.
+- Do not collapse them into one magic score unless the score is explicitly
+  weighted for a product goal.
+
+### Next Deep Pass
+
+Add `LayoutTrajectoryReport`:
+
+- run candidate and exact from the same warm start for N ticks.
+- compare final positions by node displacement.
+- compare quality metric deltas.
+- report speed per tick and total settle cost.
+- support fixture-specific goals: hierarchy, community, fold, broad cloud.
+
+That is the next fair trial for organs. One snapshot is just a mugshot.
+
 ## Second Sweep: More Knobs
 
 Date: 2026-05-07

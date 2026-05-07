@@ -4,7 +4,7 @@ use std::path::Path;
 
 use epiphany_graph_rs::{
     Graph, Layout3dConfig, Layout3dSolver, RepulsionAccuracyCandidate, RepulsionMode,
-    solver_structural_accuracy_sweep,
+    evaluate_layout_quality, solver_structural_accuracy_sweep,
 };
 
 fn main() {
@@ -18,16 +18,18 @@ fn main() {
     ];
 
     println!(
-        "dataset,nodes,edges,communities,cores,mode,theta,body_mode,body_scale,body_far,elapsed_us,mean_abs,max_abs,mean_rel,rms_rel,max_rel"
+        "dataset,nodes,edges,communities,cores,mode,theta,body_mode,body_scale,body_far,elapsed_us,mean_abs,max_abs,mean_rel,rms_rel,max_rel,fold_compactness,group_separation,rank_error,edge_mean,edge_var,bridge_mean,bridge_var"
     );
 
     for fixture in fixtures() {
-        let mut solver = Layout3dSolver::new(fixture.graph, Layout3dConfig::default());
+        let base_graph = fixture.graph.clone();
+        let mut solver = Layout3dSolver::new(base_graph.clone(), Layout3dConfig::default());
         solver.tick(8);
         let reports = solver_structural_accuracy_sweep(&solver, &candidates);
         for report in reports {
+            let quality = candidate_quality(&base_graph, &report.candidate);
             println!(
-                "{},{},{},{},{},{},{:.2},{},{:.2},{:.2},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                "{},{},{},{},{},{},{:.2},{},{:.2},{:.2},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
                 fixture.name,
                 solver.positions().len(),
                 fixture.edge_count,
@@ -43,7 +45,14 @@ fn main() {
                 report.max_absolute_error,
                 report.mean_relative_error,
                 report.rms_relative_error,
-                report.max_relative_error
+                report.max_relative_error,
+                quality.mean_fold_compactness,
+                quality.mean_group_separation,
+                quality.mean_rank_error,
+                quality.edge_length_mean,
+                quality.edge_length_variance,
+                quality.bridge_length_mean,
+                quality.bridge_length_variance
             );
         }
     }
@@ -53,6 +62,31 @@ struct Fixture {
     name: &'static str,
     graph: Graph,
     edge_count: usize,
+}
+
+fn candidate_quality(
+    graph: &Graph,
+    candidate: &RepulsionAccuracyCandidate,
+) -> epiphany_graph_rs::LayoutQualityReport {
+    let config = Layout3dConfig {
+        repulsion_mode: candidate.repulsion_mode,
+        barnes_hut_theta: candidate.barnes_hut_theta,
+        grid_cell_size: candidate.grid_cell_size,
+        grid_radius: candidate.grid_radius,
+        barnes_hut_near_radius: candidate.barnes_hut_near_radius,
+        near_repulsion_scale: candidate.near_repulsion_scale,
+        far_repulsion_scale: candidate.far_repulsion_scale,
+        body_repulsion_mode: candidate.body_repulsion_mode,
+        body_repulsion_scale: candidate.body_repulsion_scale,
+        body_exact_limit: candidate.body_exact_limit,
+        body_far_repulsion_scale: candidate.body_far_repulsion_scale,
+        ..Layout3dConfig::default()
+    };
+
+    let mut solver = Layout3dSolver::new(graph.clone(), config);
+    solver.tick(32);
+    let layout = solver.snapshot();
+    evaluate_layout_quality(graph, &layout)
 }
 
 fn fixtures() -> Vec<Fixture> {

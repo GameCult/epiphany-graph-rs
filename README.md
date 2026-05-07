@@ -170,6 +170,10 @@ cargo run --release --example organ_battleground
 It compares raw node approximations and body-force candidates on synthetic
 fixtures plus SNAP email/Gnutella datasets when available.
 
+Use `evaluate_layout_quality(&graph, &layout)` to score fold compactness, group
+separation, rank error, edge length variance, and bridge length variance for a
+layout snapshot.
+
 ## Graph Analysis And Folding
 
 The crate exposes `analyze(&graph)` for layout-independent structure reads:

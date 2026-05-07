@@ -334,6 +334,21 @@ pub struct ForceAccuracyReport {
     pub max_relative_error: f32,
 }
 
+/// Structure-oriented quality metrics for a concrete layout snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LayoutQualityReport {
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub fold_group_count: usize,
+    pub mean_fold_compactness: f32,
+    pub mean_group_separation: f32,
+    pub mean_rank_error: f32,
+    pub edge_length_mean: f32,
+    pub edge_length_variance: f32,
+    pub bridge_length_mean: f32,
+    pub bridge_length_variance: f32,
+}
+
 /// Output for one laid-out node.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeLayout {
@@ -661,6 +676,37 @@ pub fn layout_3d(graph: &Graph, config: &Layout3dConfig) -> Layout3d {
     let mut solver = Layout3dSolver::new(graph.clone(), config.clone());
     solver.tick(config.base.iterations);
     solver.snapshot()
+}
+
+/// Evaluate structure-level readability metrics for a layout.
+pub fn evaluate_layout_quality(graph: &Graph, layout: &Layout3d) -> LayoutQualityReport {
+    let positions = layout
+        .nodes
+        .iter()
+        .map(|node| (node.x, node.y, node.z))
+        .collect::<Vec<_>>();
+
+    let (edge_length_mean, edge_length_variance) = edge_length_stats(graph.edges(), &positions);
+    let bridge_edges = layout
+        .analysis
+        .bridges
+        .iter()
+        .filter_map(|edge| graph.edges().get(edge.0).copied())
+        .collect::<Vec<_>>();
+    let (bridge_length_mean, bridge_length_variance) = edge_length_stats(&bridge_edges, &positions);
+
+    LayoutQualityReport {
+        node_count: graph.node_count(),
+        edge_count: graph.edge_count(),
+        fold_group_count: layout.fold_groups.len(),
+        mean_fold_compactness: mean_fold_compactness(&layout.fold_groups),
+        mean_group_separation: mean_group_separation(&layout.fold_groups),
+        mean_rank_error: mean_rank_error(&layout.nodes, &layout.constraints),
+        edge_length_mean,
+        edge_length_variance,
+        bridge_length_mean,
+        bridge_length_variance,
+    }
 }
 
 /// Compare repulsion approximations against exact all-pairs repulsion.
@@ -2148,6 +2194,99 @@ fn magnitude_3d(vector: (f32, f32, f32)) -> f32 {
     (vector.0 * vector.0 + vector.1 * vector.1 + vector.2 * vector.2).sqrt()
 }
 
+fn edge_length_stats(edges: &[(NodeId, NodeId)], positions: &[(f32, f32, f32)]) -> (f32, f32) {
+    if edges.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let lengths = edges
+        .iter()
+        .map(|&(source, target)| distance_3d(positions[source.0], positions[target.0]))
+        .collect::<Vec<_>>();
+    mean_and_variance(&lengths)
+}
+
+fn mean_fold_compactness(fold_groups: &[FoldGroup]) -> f32 {
+    let groups = fold_groups
+        .iter()
+        .filter(|group| group.nodes.len() > 1)
+        .collect::<Vec<_>>();
+    if groups.is_empty() {
+        return 0.0;
+    }
+
+    groups
+        .iter()
+        .map(|group| group.radius / (group.nodes.len() as f32).sqrt().max(1.0))
+        .sum::<f32>()
+        / groups.len() as f32
+}
+
+fn mean_group_separation(fold_groups: &[FoldGroup]) -> f32 {
+    if fold_groups.len() < 2 {
+        return 0.0;
+    }
+
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+    for left in 0..fold_groups.len() {
+        for right in (left + 1)..fold_groups.len() {
+            let left_center = fold_groups[left].center;
+            let right_center = fold_groups[right].center;
+            let distance = distance_arrays_3d(left_center, right_center);
+            let radii = fold_groups[left].radius + fold_groups[right].radius;
+            sum += distance / radii.max(1.0);
+            count += 1;
+        }
+    }
+
+    sum / count.max(1) as f32
+}
+
+fn mean_rank_error(nodes: &[NodeLayout3d], constraints: &ConstraintSet) -> f32 {
+    if constraints.ranks.is_empty() {
+        return 0.0;
+    }
+
+    constraints
+        .ranks
+        .iter()
+        .map(|constraint| {
+            let y = nodes
+                .get(constraint.node.0)
+                .map(|node| node.y)
+                .unwrap_or_default();
+            (y - constraint.target_y).abs()
+        })
+        .sum::<f32>()
+        / constraints.ranks.len() as f32
+}
+
+fn mean_and_variance(values: &[f32]) -> (f32, f32) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f32>()
+        / values.len() as f32;
+    (mean, variance)
+}
+
+fn distance_3d(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    magnitude_3d((a.0 - b.0, a.1 - b.1, a.2 - b.2))
+}
+
+fn distance_arrays_3d(a: [f32; 3], b: [f32; 3]) -> f32 {
+    magnitude_3d((a[0] - b[0], a[1] - b[1], a[2] - b[2]))
+}
+
 fn apply_repulsion_3d_barnes_hut(
     positions: &[(f32, f32, f32)],
     forces: &mut [(f32, f32, f32)],
@@ -3001,5 +3140,25 @@ mod tests {
                 .iter()
                 .all(|report| report.mean_relative_error.is_finite())
         );
+    }
+
+    #[test]
+    fn layout_quality_report_scores_structure() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(1.0);
+        let b = graph.add_node(1.0);
+        let c = graph.add_node(1.0);
+        graph.add_edge(a, b);
+        graph.add_edge(b, c);
+        graph.add_edge(c, a);
+
+        let layout = layout_3d(&graph, &Layout3dConfig::default());
+        let quality = evaluate_layout_quality(&graph, &layout);
+
+        assert_eq!(quality.node_count, 3);
+        assert_eq!(quality.edge_count, 3);
+        assert!(quality.fold_group_count > 0);
+        assert!(quality.edge_length_mean.is_finite());
+        assert!(quality.mean_rank_error.is_finite());
     }
 }
