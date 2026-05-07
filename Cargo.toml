@@ -1,0 +1,11 @@
+[package]
+name = "epiphany-graph-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Hybrid Sugiyama/force-directed graph layout constraints in fast, deterministic Rust."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GameCult/epiphany-graph-rs"
+keywords = ["graph", "layout", "sugiyama", "force-directed"]
+categories = ["algorithms", "visualization"]
+
+[dependencies]
