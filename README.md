@@ -72,6 +72,40 @@ For Bevy, map `NodeLayout3d::as_xyz()` directly into `Vec3::new(x, y, z)`.
 The crate does not depend on Bevy just to borrow its vector type; the layout
 core stays small and renderer-agnostic.
 
+## Realtime Solver
+
+Use `Layout3dSolver` when Bevy needs to iterate layout over frames:
+
+```rust
+use epiphany_graph_rs::{Graph, Layout3dConfig, Layout3dSolver};
+
+let graph = Graph::new();
+let mut solver = Layout3dSolver::new(graph, Layout3dConfig::default());
+
+// In a Bevy system, run a small number of iterations per frame.
+solver.tick(2);
+
+for position in solver.positions() {
+    let (x, y, z) = *position;
+    // Transform::from_translation(Vec3::new(x, y, z))
+}
+```
+
+The solver caches graph analysis, Sugiyama constraints, ranks, order, adjacency,
+positions, and force buffers. Use `with_initial_positions` to warm-start after a
+graph edit. That keeps the layout from starting over like it suffered a small
+bureaucratic head injury.
+
+`Layout3dConfig::repulsion_mode` controls the expensive part:
+
+- `RepulsionMode::SpatialGrid` is the default realtime path.
+- `RepulsionMode::Exact` keeps all-pairs repulsion for small graphs or quality
+  comparisons.
+
+The grid path is approximate local repulsion, not Barnes-Hut. It is the first
+practical step toward interactive scale; large graphs still want multilevel
+coarsening and a better far-field approximation.
+
 ## Graph Analysis And Folding
 
 The crate exposes `analyze(&graph)` for layout-independent structure reads:

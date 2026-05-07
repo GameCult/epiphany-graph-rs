@@ -5,7 +5,7 @@
 //! relaxes those constraints alongside springs, repulsion, and collision.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 /// Index of a node in a [`Graph`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -147,6 +147,12 @@ pub struct Layout3dConfig {
     pub core_anchor_strength: f32,
     /// Force keeping high-clustering neighborhoods compact.
     pub clustering_cohesion_strength: f32,
+    /// Repulsion strategy used by the 3D solver.
+    pub repulsion_mode: RepulsionMode,
+    /// Spatial-grid cell size for approximate repulsion.
+    pub grid_cell_size: f32,
+    /// Number of neighboring cells searched around each node.
+    pub grid_radius: i32,
 }
 
 impl Default for Layout3dConfig {
@@ -166,8 +172,20 @@ impl Default for Layout3dConfig {
             community_cohesion_strength: 0.025,
             core_anchor_strength: 0.018,
             clustering_cohesion_strength: 0.02,
+            repulsion_mode: RepulsionMode::SpatialGrid,
+            grid_cell_size: 180.0,
+            grid_radius: 1,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RepulsionMode {
+    /// Exact all-pairs repulsion. Best for quality on small graphs.
+    Exact,
+    /// Approximate local repulsion through a uniform spatial grid.
+    #[default]
+    SpatialGrid,
 }
 
 /// Output for one laid-out node.
@@ -213,6 +231,147 @@ pub struct Layout3d {
     pub constraints: ConstraintSet,
     pub analysis: GraphAnalysis,
     pub fold_groups: Vec<FoldGroup>,
+}
+
+/// Cached, incremental 3D layout solver for realtime render loops.
+#[derive(Clone, Debug)]
+pub struct Layout3dSolver {
+    graph: Graph,
+    config: Layout3dConfig,
+    analysis: GraphAnalysis,
+    ranks: Vec<usize>,
+    orders: Vec<usize>,
+    constraints: ConstraintSet,
+    undirected: Vec<Vec<(usize, EdgeId)>>,
+    positions: Vec<(f32, f32, f32)>,
+    forces: Vec<(f32, f32, f32)>,
+    tick_count: usize,
+}
+
+impl Layout3dSolver {
+    /// Build a solver with fresh deterministic initial positions.
+    pub fn new(graph: Graph, config: Layout3dConfig) -> Self {
+        Self::with_initial_positions(graph, config, &[])
+    }
+
+    /// Build a solver that reuses any supplied coordinates by node index.
+    ///
+    /// This is the warm-start path for graph edits and Bevy interactions.
+    pub fn with_initial_positions(
+        graph: Graph,
+        config: Layout3dConfig,
+        initial_positions: &[[f32; 3]],
+    ) -> Self {
+        let analysis = analyze(&graph);
+        let ranks = assign_ranks(&graph);
+        let orders = order_ranks(&graph, &ranks);
+        let constraints = build_constraints(&graph, &ranks, &orders, &config.base);
+        let undirected = undirected_adjacency(&graph);
+        let mut positions = initial_positions_3d(&ranks, &orders, &config);
+
+        for (position, initial) in positions.iter_mut().zip(initial_positions.iter()) {
+            *position = (initial[0], initial[1], initial[2]);
+        }
+
+        let forces = vec![(0.0, 0.0, 0.0); graph.node_count()];
+
+        Self {
+            graph,
+            config,
+            analysis,
+            ranks,
+            orders,
+            constraints,
+            undirected,
+            positions,
+            forces,
+            tick_count: 0,
+        }
+    }
+
+    /// Advance the solver by a small number of iterations.
+    pub fn tick(&mut self, iterations: usize) {
+        for _ in 0..iterations {
+            self.step();
+        }
+    }
+
+    /// Current node positions.
+    pub fn positions(&self) -> &[(f32, f32, f32)] {
+        &self.positions
+    }
+
+    /// Cached graph analysis.
+    pub fn analysis(&self) -> &GraphAnalysis {
+        &self.analysis
+    }
+
+    /// Cached Sugiyama-derived constraints.
+    pub fn constraints(&self) -> &ConstraintSet {
+        &self.constraints
+    }
+
+    /// Convert the current solver state into a layout snapshot.
+    pub fn snapshot(&self) -> Layout3d {
+        let mut nodes = (0..self.graph.node_count())
+            .map(|idx| NodeLayout3d {
+                id: NodeId(idx),
+                x: self.positions[idx].0,
+                y: self.positions[idx].1,
+                z: self.positions[idx].2,
+                rank: self.ranks[idx],
+                order: self.orders[idx],
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.id.0);
+
+        Layout3d {
+            nodes,
+            constraints: self.constraints.clone(),
+            analysis: self.analysis.clone(),
+            fold_groups: build_fold_groups(&self.analysis, &self.positions),
+        }
+    }
+
+    fn step(&mut self) {
+        self.forces.fill((0.0, 0.0, 0.0));
+
+        match self.config.repulsion_mode {
+            RepulsionMode::Exact => {
+                apply_repulsion_3d_exact(&self.positions, &mut self.forces, &self.config)
+            }
+            RepulsionMode::SpatialGrid => {
+                apply_repulsion_3d_grid(&self.positions, &mut self.forces, &self.config)
+            }
+        }
+        apply_springs_3d(&self.graph, &self.positions, &mut self.forces, &self.config);
+        apply_constraints_3d(
+            &self.constraints,
+            &self.positions,
+            &mut self.forces,
+            &self.config,
+        );
+        apply_structural_forces_3d(
+            &self.graph,
+            &self.undirected,
+            &self.analysis,
+            &self.positions,
+            &mut self.forces,
+            &self.config,
+        );
+        apply_grounding_3d(&self.positions, &mut self.forces, &self.config);
+
+        let cooling =
+            1.0 - (self.tick_count as f32 / self.config.base.iterations.max(1) as f32).min(1.0);
+        let step = self.config.base.step_size * cooling.max(0.08);
+        for (position, force) in self.positions.iter_mut().zip(self.forces.iter()) {
+            position.0 += clamp(force.0, -24.0, 24.0) * step;
+            position.1 += clamp(force.1, -24.0, 24.0) * step;
+            position.2 += clamp(force.2, -24.0, 24.0) * step;
+        }
+
+        self.tick_count += 1;
+    }
 }
 
 /// Structural analysis used to turn graph anatomy into layout pressure.
@@ -350,44 +509,9 @@ pub fn layout(graph: &Graph, config: &LayoutConfig) -> Layout {
 /// nodes across X/Z, while ground and depth forces keep the structure shallow
 /// enough to read in a 3D scene.
 pub fn layout_3d(graph: &Graph, config: &Layout3dConfig) -> Layout3d {
-    let n = graph.node_count();
-    if n == 0 {
-        return Layout3d {
-            nodes: Vec::new(),
-            constraints: ConstraintSet::default(),
-            analysis: GraphAnalysis::default(),
-            fold_groups: Vec::new(),
-        };
-    }
-
-    let analysis = analyze(graph);
-    let ranks = assign_ranks(graph);
-    let orders = order_ranks(graph, &ranks);
-    let constraints = build_constraints(graph, &ranks, &orders, &config.base);
-    let mut positions = initial_positions_3d(&ranks, &orders, config);
-
-    relax_3d(graph, &constraints, &analysis, config, &mut positions);
-
-    let mut nodes = (0..n)
-        .map(|idx| NodeLayout3d {
-            id: NodeId(idx),
-            x: positions[idx].0,
-            y: positions[idx].1,
-            z: positions[idx].2,
-            rank: ranks[idx],
-            order: orders[idx],
-        })
-        .collect::<Vec<_>>();
-    nodes.sort_by_key(|node| node.id.0);
-
-    let fold_groups = build_fold_groups(&analysis, &positions);
-
-    Layout3d {
-        nodes,
-        constraints,
-        analysis,
-        fold_groups,
-    }
+    let mut solver = Layout3dSolver::new(graph.clone(), config.clone());
+    solver.tick(config.base.iterations);
+    solver.snapshot()
 }
 
 /// Analyze graph structure without running layout.
@@ -1146,36 +1270,6 @@ fn relax(
     }
 }
 
-fn relax_3d(
-    graph: &Graph,
-    constraints: &ConstraintSet,
-    analysis: &GraphAnalysis,
-    config: &Layout3dConfig,
-    positions: &mut [(f32, f32, f32)],
-) {
-    let n = graph.node_count();
-    let mut forces = vec![(0.0f32, 0.0f32, 0.0f32); n];
-    let undirected = undirected_adjacency(graph);
-
-    for iter in 0..config.base.iterations {
-        forces.fill((0.0, 0.0, 0.0));
-
-        apply_repulsion_3d(positions, &mut forces, config);
-        apply_springs_3d(graph, positions, &mut forces, config);
-        apply_constraints_3d(constraints, positions, &mut forces, config);
-        apply_structural_forces_3d(graph, &undirected, analysis, positions, &mut forces, config);
-        apply_grounding_3d(positions, &mut forces, config);
-
-        let cooling = 1.0 - (iter as f32 / config.base.iterations.max(1) as f32);
-        let step = config.base.step_size * cooling.max(0.08);
-        for (position, force) in positions.iter_mut().zip(forces.iter()) {
-            position.0 += clamp(force.0, -24.0, 24.0) * step;
-            position.1 += clamp(force.1, -24.0, 24.0) * step;
-            position.2 += clamp(force.2, -24.0, 24.0) * step;
-        }
-    }
-}
-
 fn apply_structural_forces_3d(
     graph: &Graph,
     undirected: &[Vec<(usize, EdgeId)>],
@@ -1539,7 +1633,7 @@ fn apply_repulsion(positions: &[(f32, f32)], forces: &mut [(f32, f32)], strength
     }
 }
 
-fn apply_repulsion_3d(
+fn apply_repulsion_3d_exact(
     positions: &[(f32, f32, f32)],
     forces: &mut [(f32, f32, f32)],
     config: &Layout3dConfig,
@@ -1563,6 +1657,76 @@ fn apply_repulsion_3d(
             forces[b].2 -= fz;
         }
     }
+}
+
+fn apply_repulsion_3d_grid(
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    if positions.len() < 2 {
+        return;
+    }
+
+    let cell_size = config.grid_cell_size.max(1.0);
+    let radius = config.grid_radius.max(0);
+    let mut grid = HashMap::<(i32, i32, i32), Vec<usize>>::new();
+
+    for (idx, &position) in positions.iter().enumerate() {
+        grid.entry(grid_cell(position, cell_size))
+            .or_default()
+            .push(idx);
+    }
+
+    for a in 0..positions.len() {
+        let (cx, cy, cz) = grid_cell(positions[a], cell_size);
+        for x in (cx - radius)..=(cx + radius) {
+            for y in (cy - radius)..=(cy + radius) {
+                for z in (cz - radius)..=(cz + radius) {
+                    if let Some(candidates) = grid.get(&(x, y, z)) {
+                        for &b in candidates {
+                            if b <= a {
+                                continue;
+                            }
+                            apply_pair_repulsion_3d(a, b, positions, forces, config);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn grid_cell(position: (f32, f32, f32), cell_size: f32) -> (i32, i32, i32) {
+    (
+        (position.0 / cell_size).floor() as i32,
+        (position.1 / cell_size).floor() as i32,
+        (position.2 / cell_size).floor() as i32,
+    )
+}
+
+fn apply_pair_repulsion_3d(
+    a: usize,
+    b: usize,
+    positions: &[(f32, f32, f32)],
+    forces: &mut [(f32, f32, f32)],
+    config: &Layout3dConfig,
+) {
+    let dx = positions[a].0 - positions[b].0;
+    let dy = positions[a].1 - positions[b].1;
+    let dz = positions[a].2 - positions[b].2;
+    let dist2 = (dx * dx + dy * dy + dz * dz).max(0.01);
+    let dist = dist2.sqrt();
+    let magnitude = config.base.repulsion_strength / dist2;
+    let fx = dx / dist * magnitude * config.horizontal_repulsion;
+    let fy = dy / dist * magnitude * config.vertical_repulsion;
+    let fz = dz / dist * magnitude * config.horizontal_repulsion;
+    forces[a].0 += fx;
+    forces[a].1 += fy;
+    forces[a].2 += fz;
+    forces[b].0 -= fx;
+    forces[b].1 -= fy;
+    forces[b].2 -= fz;
 }
 
 fn apply_springs(
@@ -1885,5 +2049,54 @@ mod tests {
                 .iter()
                 .any(|group| group.kind == FoldGroupKind::CoreShell)
         );
+    }
+
+    #[test]
+    fn solver_ticks_incrementally_and_snapshots_layout() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(1.0);
+        let b = graph.add_node(1.0);
+        graph.add_edge(a, b);
+
+        let mut solver = Layout3dSolver::new(graph, Layout3dConfig::default());
+        let before = solver.positions().to_vec();
+        solver.tick(4);
+        let after = solver.positions().to_vec();
+        let snapshot = solver.snapshot();
+
+        assert_ne!(before, after);
+        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.constraints.ranks.len(), 2);
+    }
+
+    #[test]
+    fn solver_accepts_warm_start_positions() {
+        let mut graph = Graph::new();
+        graph.add_node(1.0);
+        graph.add_node(1.0);
+        let initial = [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]];
+
+        let solver =
+            Layout3dSolver::with_initial_positions(graph, Layout3dConfig::default(), &initial);
+
+        assert_eq!(solver.positions()[0], (10.0, 20.0, 30.0));
+        assert_eq!(solver.positions()[1], (40.0, 50.0, 60.0));
+    }
+
+    #[test]
+    fn exact_repulsion_mode_still_runs() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(1.0);
+        let b = graph.add_node(1.0);
+        graph.add_edge(a, b);
+        let config = Layout3dConfig {
+            repulsion_mode: RepulsionMode::Exact,
+            ..Layout3dConfig::default()
+        };
+
+        let mut solver = Layout3dSolver::new(graph, config);
+        solver.tick(2);
+
+        assert_eq!(solver.snapshot().nodes.len(), 2);
     }
 }

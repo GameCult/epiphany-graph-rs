@@ -14,6 +14,9 @@ solver express it.
 
 These features are implemented in the crate now:
 
+- Persistent `Layout3dSolver` for realtime frame-by-frame iteration.
+- Warm-start positions for graph edits and interaction.
+- Spatial-grid approximate repulsion for the 3D solver.
 - SCC detection for cyclic bodies.
 - weak components for broad spatial islands.
 - articulation points and bridges for hinge-like connectors.
@@ -69,8 +72,14 @@ crate is adaptive step control and Barnes-Hut for large interactive layouts.
 Implementation direction:
 
 - Replace fixed cooling with adaptive speed.
-- Add Barnes-Hut or grid approximation for repulsion.
+- Upgrade spatial-grid repulsion to Barnes-Hut for far-field approximation.
 - Expose live-tick APIs for Bevy interaction instead of only batch layout.
+
+Current state:
+
+- `Layout3dSolver` exists.
+- `RepulsionMode::SpatialGrid` is the default realtime path.
+- `RepulsionMode::Exact` remains available for small graphs and comparisons.
 
 Source:
 https://doi.org/10.1371/journal.pone.0098679
