@@ -2799,6 +2799,142 @@ fn clamp(value: f32, min: f32, max: f32) -> f32 {
     value.max(min).min(max)
 }
 
+/// Allocate bytes in the wasm module for host-written typed arrays.
+///
+/// The raw ABI is intentionally tiny so browser consumers can use this crate
+/// without a binding generator. Hosts must release the pointer with
+/// [`epiphany_graph_dealloc`].
+#[unsafe(no_mangle)]
+pub extern "C" fn epiphany_graph_alloc(len: usize) -> *mut u8 {
+    let mut buffer = Vec::<u8>::with_capacity(len);
+    let ptr = buffer.as_mut_ptr();
+    std::mem::forget(buffer);
+    ptr
+}
+
+/// Release a pointer previously returned by [`epiphany_graph_alloc`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn epiphany_graph_dealloc(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+
+    unsafe {
+        drop(Vec::from_raw_parts(ptr, 0, len));
+    }
+}
+
+/// Allocate `f32` slots for host-written typed arrays.
+#[unsafe(no_mangle)]
+pub extern "C" fn epiphany_graph_alloc_f32(count: usize) -> *mut f32 {
+    let mut buffer = Vec::<f32>::with_capacity(count);
+    let ptr = buffer.as_mut_ptr();
+    std::mem::forget(buffer);
+    ptr
+}
+
+/// Release `f32` slots previously returned by [`epiphany_graph_alloc_f32`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn epiphany_graph_dealloc_f32(ptr: *mut f32, count: usize) {
+    if ptr.is_null() || count == 0 {
+        return;
+    }
+
+    unsafe {
+        drop(Vec::from_raw_parts(ptr, 0, count));
+    }
+}
+
+/// Allocate `u32` slots for host-written typed arrays.
+#[unsafe(no_mangle)]
+pub extern "C" fn epiphany_graph_alloc_u32(count: usize) -> *mut u32 {
+    let mut buffer = Vec::<u32>::with_capacity(count);
+    let ptr = buffer.as_mut_ptr();
+    std::mem::forget(buffer);
+    ptr
+}
+
+/// Release `u32` slots previously returned by [`epiphany_graph_alloc_u32`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn epiphany_graph_dealloc_u32(ptr: *mut u32, count: usize) {
+    if ptr.is_null() || count == 0 {
+        return;
+    }
+
+    unsafe {
+        drop(Vec::from_raw_parts(ptr, 0, count));
+    }
+}
+
+/// Layout a directed graph through the hybrid Rust solver.
+///
+/// Inputs:
+/// - `node_weights_ptr`: `node_count` little-endian `f32` values.
+/// - `edge_pairs_ptr`: `edge_count * 2` little-endian `u32` node indices.
+/// - `output_ptr`: `node_count * 4` little-endian `f32` slots.
+///
+/// Output tuple per node is `(x, y, rank, order)` sorted by node index.
+/// Returns `0` on success and a negative value for malformed input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn epiphany_graph_layout_2d(
+    node_weights_ptr: *const f32,
+    node_count: usize,
+    edge_pairs_ptr: *const u32,
+    edge_count: usize,
+    output_ptr: *mut f32,
+    iterations: usize,
+    rank_gap: f32,
+    node_gap: f32,
+    edge_length: f32,
+) -> i32 {
+    if node_count == 0 {
+        return 0;
+    }
+
+    if node_weights_ptr.is_null() || output_ptr.is_null() {
+        return -1;
+    }
+
+    if edge_count > 0 && edge_pairs_ptr.is_null() {
+        return -2;
+    }
+
+    let node_weights = unsafe { std::slice::from_raw_parts(node_weights_ptr, node_count) };
+    let edge_pairs = unsafe { std::slice::from_raw_parts(edge_pairs_ptr, edge_count * 2) };
+    let output = unsafe { std::slice::from_raw_parts_mut(output_ptr, node_count * 4) };
+    let mut graph = Graph::with_capacity(node_count, edge_count);
+
+    for &weight in node_weights {
+        graph.add_node(weight.max(0.001));
+    }
+
+    for edge_index in 0..edge_count {
+        let source = edge_pairs[edge_index * 2] as usize;
+        let target = edge_pairs[edge_index * 2 + 1] as usize;
+        if source >= node_count || target >= node_count {
+            return -3;
+        }
+        graph.add_edge(NodeId(source), NodeId(target));
+    }
+
+    let mut config = LayoutConfig::default();
+    config.iterations = iterations.max(1);
+    config.rank_gap = rank_gap.max(1.0);
+    config.node_gap = node_gap.max(1.0);
+    config.edge_length = edge_length.max(1.0);
+    let result = layout(&graph, &config);
+
+    for node in result.nodes {
+        let base = node.id.0 * 4;
+        output[base] = node.x;
+        output[base + 1] = node.y;
+        output[base + 2] = node.rank as f32;
+        output[base + 3] = node.order as f32;
+    }
+
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

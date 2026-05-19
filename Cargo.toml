@@ -9,3 +9,6 @@ keywords = ["graph", "layout", "sugiyama", "force-directed"]
 categories = ["algorithms", "visualization"]
 
 [dependencies]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
